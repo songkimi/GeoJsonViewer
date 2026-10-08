@@ -1,0 +1,15 @@
+# 构建输出
+bin/
+obj/
+
+# Visual Studio 的本地元数据（窗口布局、缓存等）
+.vs/
+
+# 沙箱/无人值守构建时指定的 dotnet 用户目录（见 build.ps1 里的 DOTNET_CLI_HOME）
+.dotnet-home/
+
+# 自检输出文件（每次 pwsh -File .\build.ps1 selftest 都会重新生成）
+.selftest-output.txt
+
+# 个人存档：项目总结 + 简历 / 面试素材，不随项目上传
+项目总结_简历与面试讲法.md

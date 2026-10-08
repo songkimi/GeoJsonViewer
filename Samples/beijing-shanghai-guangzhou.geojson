@@ -1,0 +1,36 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "name": "北京", "type": "首都" },
+      "geometry": { "type": "Point", "coordinates": [116.4074, 39.9042] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "上海", "type": "直辖市" },
+      "geometry": { "type": "Point", "coordinates": [121.4737, 31.2304] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "广州", "type": "省会" },
+      "geometry": { "type": "Point", "coordinates": [113.2644, 23.1291] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "北京—上海" },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [[116.4074, 39.9042], [121.4737, 31.2304]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "一个三角形（测试面）" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[116.0, 40.2], [117.2, 40.2], [116.6, 39.2], [116.0, 40.2]]]
+      }
+    }
+  ]
+}

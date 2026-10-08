@@ -1,0 +1,48 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "name": "OnlyHere-Point" },
+      "geometry": { "type": "Point", "coordinates": [120.0, 35.0] }
+    },
+    42,
+    "我是一个字符串，不是对象",
+    null,
+    {
+      "type": "Feature",
+      "properties": { "name": "MultiPoint-两个点" },
+      "geometry": { "type": "MultiPoint", "coordinates": [[110.0, 30.0], [111.0, 31.0]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "GeometryCollection-不支持" },
+      "geometry": { "type": "GeometryCollection", "geometries": [] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "MultiLineString-一条线" },
+      "geometry": { "type": "MultiLineString", "coordinates": [[[100.0, 20.0], [101.0, 21.0]]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "MultiPolygon-一个三角形" },
+      "geometry": { "type": "MultiPolygon", "coordinates": [[[[90.0, 10.0], [91.0, 10.0], [90.5, 9.0], [90.0, 10.0]]]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "UnPoint-坐标里混进了字符串" },
+      "geometry": { "type": "Point", "coordinates": ["116.0", "39.0"] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "TooFew-坐标只有一个数" },
+      "geometry": { "type": "Point", "coordinates": [116.0] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "NotAFeature-没有 geometry 字段" },
+      "type": "Feature"
+    }
+  ]
+}

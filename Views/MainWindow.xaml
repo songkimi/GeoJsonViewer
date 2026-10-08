@@ -1,0 +1,76 @@
+<Window x:Class="GeoJsonViewer.Views.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="GeoJsonViewer" Height="760" Width="1120"
+        FontFamily="Microsoft YaHei UI" FontSize="13"
+        Background="#FF1E2228">
+
+    <!-- 布局说明：DockPanel 负责"工具栏在上、状态栏在下、中间全给画布"，
+         中间那块用 Grid 叠放两层：底层是 Canvas，上层是提示浮层。 -->
+    <DockPanel>
+
+        <ToolBarTray DockPanel.Dock="Top">
+            <ToolBar>
+                <Button x:Name="OpenButton" Content="打开…" Click="OnOpenClick" Padding="10,2"/>
+                <Separator/>
+                <TextBlock Text="投影:" VerticalAlignment="Center" Margin="4,0"/>
+                <ComboBox x:Name="ProjectionBox" Width="130" SelectedIndex="0"
+                          SelectionChanged="OnProjectionChanged">
+                    <ComboBoxItem Content="线性"/>
+                    <ComboBoxItem Content="Web 墨卡托"/>
+                </ComboBox>
+            </ToolBar>
+        </ToolBarTray>
+
+        <StatusBar DockPanel.Dock="Bottom">
+            <StatusBarItem>
+                <TextBlock x:Name="StatusText" Text="还没有打开文件"/>
+            </StatusBarItem>
+            <StatusBarItem HorizontalAlignment="Right">
+                <TextBlock x:Name="CursorPositionText" Foreground="#FF8A94A6"/>
+            </StatusBarItem>
+        </StatusBar>
+
+        <Grid>
+            <!-- ClipToBounds：不加的话，放大后的图形会画到工具栏下面去 -->
+            <Canvas x:Name="MapCanvas" Background="#FF1E2228"
+                    ClipToBounds="True"
+                    MouseWheel="OnCanvasMouseWheel"
+                    MouseLeftButtonDown="OnCanvasMouseLeftButtonDown"
+                    MouseLeftButtonUp="OnCanvasMouseLeftButtonUp"
+                    MouseMove="OnCanvasMouseMove"
+                    MouseLeave="OnCanvasMouseLeave"
+                    SizeChanged="OnCanvasSizeChanged"/>
+
+            <!-- 出错/无数据时的中央提示：默认隐藏，只改 Text 不改结构 -->
+            <Border x:Name="MessagePanel" Visibility="Collapsed"
+                    HorizontalAlignment="Center" VerticalAlignment="Center"
+                    Background="#CC2A3038" BorderBrush="#FF444C57" BorderThickness="1"
+                    CornerRadius="6" Padding="18,12">
+                <TextBlock x:Name="MessageText" Foreground="#FFD8DEE9" TextWrapping="Wrap"
+                           MaxWidth="520" TextAlignment="Center"/>
+            </Border>
+
+            <!-- 悬停提示：Border + TextBlock，跟着鼠标走。
+                 为什么不用 WPF 自带的 ToolTip：自带的没法跟手，
+                 而且会挡住鼠标本身，命中测试会抖。
+
+                 位置用 Margin 而不是 TranslateTransform（渲染变换）：
+                 Border 放在 Grid 里，对齐方式默认是 Stretch，
+                 不写 HorizontalAlignment/VerticalAlignment=Left/Top 就会被拉伸
+                 填满整个画布单元格，尺寸不再由文字决定；写成 Left/Top 后框子
+                 只包住文字，加 Margin 的效果等价于"左上角放在 (Margin.Left, Margin.Top)"，
+                 鼠标位置和提示框左上角是**一一对应**的，好算也好夹。
+                 用 TranslateTransform 时只能控制平移量，框子从哪长出来
+                 取决于它自己的布局位置和大小，框一变宽就会"飘"，
+                 而且会直接长出窗口外面（没有地方能夹住它）。 -->
+            <Border x:Name="HoverTip" Visibility="Collapsed"
+                    Background="#F02A3038" BorderBrush="#FF5B8DD9" BorderThickness="1"
+                    CornerRadius="4" Padding="8,5"
+                    HorizontalAlignment="Left" VerticalAlignment="Top"
+                    IsHitTestVisible="False">
+                <TextBlock x:Name="HoverText" Foreground="#FFE8EDF4"/>
+            </Border>
+        </Grid>
+    </DockPanel>
+</Window>

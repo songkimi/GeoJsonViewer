@@ -1,0 +1,10 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "name": "全图只有这一个点" },
+      "geometry": { "type": "Point", "coordinates": [116.4074, 39.9042] }
+    }
+  ]
+}

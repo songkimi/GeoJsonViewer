@@ -1,0 +1,10 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "name": "这个对象本身是合法的，但我们永远不会看到它" },
+      "geometry": { "type": "Point", "coordinates": [116.4074, 39.9042] }
+    },
+  ]
+}
