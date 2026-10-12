@@ -23,7 +23,7 @@ using GeoJsonViewer.Models;
 public sealed class SimpleRenderer
 {
     /// <summary>渲染。返回画出来的图元数量（用于状态栏）。</summary>
-    public int Render(GeoLayer layer, ProjectionMode mode, GeoBounds bounds, Canvas target)
+    public int Render(GeoLayer layer, ProjectionSettings settings, GeoBounds bounds, Canvas target)
     {
         var drawn = 0;
 
@@ -35,7 +35,7 @@ public sealed class SimpleRenderer
             var pts = new List<Point>(feature.Geometry.Points.Count);
             foreach (var p in feature.Geometry.Points)
             {
-                var (x, y) = Projection.Project(p, mode);
+                var (x, y) = Projection.Project(p, settings);
                 var (sx, sy) = bounds.ToScreen(x, y);
                 pts.Add(new Point(sx, sy));
             }

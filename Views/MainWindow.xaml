@@ -18,6 +18,31 @@
                           SelectionChanged="OnProjectionChanged">
                     <ComboBoxItem Content="线性"/>
                     <ComboBoxItem Content="Web 墨卡托"/>
+                    <ComboBoxItem Content="高斯-克吕格"/>
+                </ComboBox>
+                <TextBlock Text="椭球:" VerticalAlignment="Center" Margin="10,0,0,0"/>
+                <ComboBox x:Name="EllipsoidBox" Width="150" SelectedIndex="0"
+                          SelectionChanged="OnProjectionChanged">
+                    <ComboBoxItem Content="CGCS2000"/>
+                    <ComboBoxItem Content="WGS84"/>
+                    <ComboBoxItem Content="北京54"/>
+                    <ComboBoxItem Content="西安80"/>
+                </ComboBox>
+                <TextBlock Text="带宽:" VerticalAlignment="Center" Margin="10,0,0,0"/>
+                <ComboBox x:Name="ZoneWidthBox" Width="66" SelectedIndex="1"
+                          SelectionChanged="OnProjectionChanged">
+                    <ComboBoxItem Content="3°"/>
+                    <ComboBoxItem Content="6°"/>
+                </ComboBox>
+                <!-- 源基准 = 文件里的坐标是哪套大地基准（不是椭球）。
+                     项顺序必须和 DatumCatalog.All 一一对应：0=CGCS2000, 1=WGS84, 2=北京54, 3=西安80 -->
+                <TextBlock Text="源基准:" VerticalAlignment="Center" Margin="10,0,0,0"/>
+                <ComboBox x:Name="SourceDatumBox" Width="110" SelectedIndex="0"
+                          SelectionChanged="OnSourceDatumChanged">
+                    <ComboBoxItem Content="CGCS2000"/>
+                    <ComboBoxItem Content="WGS84"/>
+                    <ComboBoxItem Content="北京54"/>
+                    <ComboBoxItem Content="西安80"/>
                 </ComboBox>
             </ToolBar>
         </ToolBarTray>

@@ -16,7 +16,7 @@ using GeoJsonViewer.Models;
 ///   比缩放 0.2 倍时小两个数量级。用像素单位，判定手感在任何缩放下都一致。
 ///
 /// 实现说明（两处容易踩的地方，都是实测踩出来的）：
-///   ① 每个顶点都必须走完 Projection.Project(v, mode) → bounds.ToScreen(x, y) 两步。
+///   ① 每个顶点都必须走完 Projection.Project(v, settings) → bounds.ToScreen(x, y) 两步。
 ///      ToScreen 吃的是**平面数值**，不是经纬度；漏掉 Projection 时线性模式碰巧对
 ///      （线性是恒等映射），墨卡托就整体错位——这是本项目最阴的一类 bug。
 ///   ② 内外判定（射线法）放在屏幕坐标系里做，不要在数据坐标系里混着比：
@@ -32,7 +32,7 @@ public static class HitTester
     /// 面额外支持"点在里面也算命中"（不然小图还行、大三角形只有一圈细边框能选中）。
     /// </summary>
     public static GeoFeature? HitTest(
-        GeoLayer layer, ProjectionMode mode, GeoBounds bounds,
+        GeoLayer layer, ProjectionSettings settings, GeoBounds bounds,
         double screenX, double screenY, double tolerance = 8)
     {
         GeoFeature? best = null;
@@ -50,7 +50,7 @@ public static class HitTester
             var screenPoints = new List<Point>(geometry.Points.Count);
             foreach (var p in geometry.Points)
             {
-                var (px, py) = Projection.Project(p, mode);
+                var (px, py) = Projection.Project(p, settings);
                 var (sx, sy) = bounds.ToScreen(px, py);
                 screenPoints.Add(new Point(sx, sy));
             }

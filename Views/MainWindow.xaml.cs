@@ -19,8 +19,15 @@ using Microsoft.Win32;
 public partial class MainWindow : Window
 {
     private GeoLayer? _layer;
+
+    /// <summary>
+    /// 文件里读出来的**原始**图层（坐标还是源基准那一套）。
+    /// 为什么单独留一份：基准转换不幂等 —— 永远从这一份出发，下拉框来回切才能回到原样。
+    /// </summary>
+    private GeoLayer? _rawLayer;
+
     private GeoBounds? _bounds;
-    private ProjectionMode _mode = ProjectionMode.Linear;
+    private ProjectionSettings _settings = ProjectionSettings.Linear;
 
     private Point _dragStart;          // 上一次鼠标位置（按下时定起点，移动时不断刷新）
     private bool _dragging;
@@ -63,12 +70,17 @@ public partial class MainWindow : Window
 
         try
         {
-            _layer = GeoJsonReader.ReadFile(dialog.FileName);
+            // ★ GK-3C：读出来的这一份是「原始图层」，基准转换永远从它出发（理由见 RebuildTransformedLayer）。
+            _rawLayer = GeoJsonReader.ReadFile(dialog.FileName);
+
+            
+            _layer = RebuildTransformedLayer();
         }
         catch (GeoJsonException ex)
         {
             // 解析类错误（含"文件不存在"）：这不是崩溃，是要显示给用户的一行中文话。
             _layer = null;
+            _rawLayer = null;
             _bounds = null;
             MapCanvas.Children.Clear();
             HoverTip.Visibility = Visibility.Collapsed;
@@ -79,12 +91,13 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             // 兜底：任何没预料到的异常也变成一行提示，绝不让窗口崩掉。
+            _rawLayer = null;
             ShowMessage($"打开文件时出了意外：{ex.Message}");
             StatusText.Text = "打开失败";
             return;
         }
 
-        if (_layer.Features.Count == 0)
+        if (_layer!.Features.Count == 0)
         {
             ShowMessage("这个文件里没有可显示的对象");
         }
@@ -92,12 +105,12 @@ public partial class MainWindow : Window
         {
             HideMessage();
         }
-
+        _settings = Projection.BuildSettings(ProjectionBox.SelectedIndex, EllipsoidBox.SelectedIndex, ZoneWidthBox.SelectedIndex, _layer?.LonLatBounds ?? new GeoRect());
         // 换文件 = 重新 fit：先按新数据定范围，再按当前画布尺寸算出比例。
         // 不用另外调 SetViewport：Reset 的入参就是画布尺寸，它会一并记下并重算 BaseScale。
         _bounds = new GeoBounds(ProjectAllPoints());
         _bounds.Reset(MapCanvas.ActualWidth, MapCanvas.ActualHeight);
-
+        
         RebuildView();
     }
 
@@ -108,12 +121,57 @@ public partial class MainWindow : Window
         return Directory.Exists(samples) ? samples : AppContext.BaseDirectory;
     }
 
+    // ───────────────────────── 基准（基准 ≠ 椭球） ─────────────────────────
+
+    /// <summary>
+    /// 按工具栏「源基准」把 _rawLayer 转换到 CGCS2000，返回**显示用**的那个图层。
+    ///
+    /// 为什么输入必须是 _rawLayer、而不是 _layer：
+    ///   TransformLayer 是纯函数，但它**不幂等** —— 在已经转换过的图层上再按同一个源基准转一次，
+    ///   等于把偏移量又叠加一遍（北京54 → CGCS2000 在北京那种位置一次约 198 米，转两次就快 400 米）。
+    ///   自检 [13] 里有一条专门量这件事。"来回切下拉框能不能回到原样"全看这一条。
+    ///
+    /// 为什么目标固定是 CGCS2000：
+    ///   本项目的投影（高斯 / 墨卡托）都按 CGCS2000 算。源基准只说明"文件里的坐标是哪套基准"，
+    ///   统一到 CGCS2000 之后，投影、fit、命中测试就都能用同一套数字。
+    ///
+    /// 下拉框的项顺序和 DatumCatalog.All 一一对应（0=CGCS2000, 1=WGS84, 2=北京54, 3=西安80）；
+    /// 大地高本项目一律按 0（"所有点都贴在地面上"这个前提写在 TransformLayer 的签名上）。
+    /// </summary>
+    private GeoLayer? RebuildTransformedLayer()
+    {
+        if (_rawLayer is null) return null; 
+        var source = DatumCatalog.All[SourceDatumBox.SelectedIndex]; 
+        return DatumTransform.TransformLayer(_rawLayer, source, DatumCatalog.Cgcs2000, 0.0);
+    }
+        
+
+    /// <summary>换源基准：坐标整体挪了几百米，所以要重新转换 → 重新 fit → 重画。</summary>
+    private void OnSourceDatumChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        // XAML 是一个节点一个节点解析的：这个下拉框在窗口构造时也会触发一次 —— 那时还没有文件。
+        if (_rawLayer is null) return;
+        _layer = RebuildTransformedLayer();
+        _bounds = new GeoBounds(ProjectAllPoints());
+        _bounds.Reset(MapCanvas.ActualWidth, MapCanvas.ActualHeight);
+        RebuildView();
+        
+    }
+
     // ─────────────────────────────── 投影模式 ───────────────────────────────
 
     private void OnProjectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
     {
-        // 下拉框的两项顺序和枚举顺序一一对应：0=Linear, 1=WebMercator
-        _mode = ProjectionBox.SelectedIndex == 1 ? ProjectionMode.WebMercator : ProjectionMode.Linear;
+        // XAML 是一个节点一个节点解析的：解析到"投影"这个下拉框并读到 SelectedIndex 时，
+        // 它后面那两个下拉框（椭球、带宽）**还没有被创建**，读它们就是 null。
+        // 这不是"理论上可能"，是每次启动都会发生的事 —— 少了这一句就是启动即崩。
+        if (EllipsoidBox is null || ZoneWidthBox is null) return;
+
+        // 现在是两项时的写法。加了第三项「高斯-克吕格」以后，这里要改成按三个下拉框建设置：
+        //   高斯模式读椭球下拉 + 带宽下拉，中央经线则是拿数据的经度范围中点自动选出来的。
+        // 下拉框的项顺序和枚举顺序一一对应：0=Linear, 1=WebMercator, 2=GaussKruger
+        _settings = Projection.BuildSettings(ProjectionBox.SelectedIndex, EllipsoidBox.SelectedIndex, ZoneWidthBox.SelectedIndex, _layer?.LonLatBounds ?? new GeoRect());
+
 
         if (_layer is null) return;
 
@@ -124,9 +182,9 @@ public partial class MainWindow : Window
         RebuildView();
     }
 
-    /// <summary>把图层里所有点按当前模式投影一遍。fit 和渲染都以它为准。</summary>
+    /// <summary>把图层里所有点按当前设置投影一遍。fit 和渲染都以它为准。</summary>
     private IEnumerable<(double X, double Y)> ProjectAllPoints()
-        => _layer!.AllPoints().Select(p => Projection.Project(p, _mode));
+        => _layer!.AllPoints().Select(p => Projection.Project(p, _settings));
 
     // ─────────────────────────────── 缩放与平移 ───────────────────────────────
 
@@ -232,7 +290,7 @@ public partial class MainWindow : Window
     {
         if (_layer is null || _bounds is null || !_bounds.HasViewport) return;
 
-        var hit = HitTester.HitTest(_layer, _mode, _bounds, pos.X, pos.Y);
+        var hit = HitTester.HitTest(_layer, _settings, _bounds, pos.X, pos.Y);
 
         if (hit is null)
         {
@@ -318,7 +376,7 @@ public partial class MainWindow : Window
         MapCanvas.Children.Clear();
 
         var renderer = new Rendering.SimpleRenderer();
-        renderer.Render(_layer, _mode, _bounds, MapCanvas);
+        renderer.Render(_layer, _settings, _bounds, MapCanvas);
 
         if (_layer.Features.Count == 0) ShowMessage("这个文件里没有可显示的对象");
         else HideMessage();
@@ -337,12 +395,25 @@ public partial class MainWindow : Window
             return;
         }
 
-        var modeName = _mode == ProjectionMode.Linear ? "线性" : "Web 墨卡托";
+        var modeName = _settings.DisplayName;
         var skipped = _layer.SkippedCount > 0 ? $"　·　跳过了 {_layer.SkippedCount} 个不支持的对象" : "";
         var zoom = _bounds is null ? "" : $"　·　缩放 {_bounds.Zoom:0.00}×";
 
-        StatusText.Text = $"{_layer.FileName}　·　{_layer.Features.Count} 个对象{skipped}{zoom}　·　投影：{modeName}";
+        var text = $"{_layer.FileName}　·　{_layer.Features.Count} 个对象{skipped}{zoom}　·　投影：{modeName}";
+        
         Title = $"GeoJsonViewer — {_layer.FileName}（{_layer.Features.Count} 个对象）";
+        if (_settings.Mode == ProjectionMode.GaussKruger)
+        {
+            if (_layer.LonLatBounds is null)
+            {
+                text += "　·　该文件没有经纬度边界，按照0°来处理";
+            }
+            else if(!GaussKruger.FitsInZone(_layer.LonLatBounds.Value.MinLon, _layer.LonLatBounds.Value.MaxLon, _settings.CentralMeridianDegrees, _settings.ZoneWidthDegrees))
+            {
+                text += "　·　警告：该文件的经纬度边界不在当前投影带内";
+            }
+        }
+        StatusText.Text = text;
     }
 
     /// <summary>把鼠标位置换算成经纬度显示在状态栏（缩放锚点对不对，看这个数字最直观）。</summary>
@@ -353,7 +424,19 @@ public partial class MainWindow : Window
         try
         {
             var (x, y) = _bounds.ToData(pos.X, pos.Y);
-            var (lon, lat) = (x, y);   // 线性模式下平面数值就等于经纬度；墨卡托模式下这里只是近似
+            double lon, lat;
+            if (_settings.Mode == ProjectionMode.GaussKruger)
+            {
+                // 高斯模式的平面数值单位是米，必须用反算换回经纬度。
+                // ★ GaussKruger.Inverse 要的是测绘坐标 (x 北, y 东)，而这里的 x 是"水平"、y 是"垂直"，
+                //   也就是这里的 (x, y) 恰好是 (东, 北) —— 调用时两个实参必须调过来。
+                var p = GaussKruger.Inverse(y, x, _settings.Ellipsoid, _settings.CentralMeridianDegrees);
+                (lon, lat) = (p.Lon, p.Lat);
+            }
+            else
+            {
+                (lon, lat) = (x, y);   // 线性模式下平面数值就等于经纬度；墨卡托模式下这里只是近似
+            }
             CursorPositionText.Text = $"光标：{lon:0.0000}, {lat:0.0000}";
         }
         catch (NotImplementedException)
