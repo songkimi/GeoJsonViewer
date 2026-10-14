@@ -41,6 +41,7 @@ public static class SelfTest
         var gaussKrugerZoneFailures = 0;
         var datumTransformFailures = 0;
         var datumLayerFailures = 0;
+        var zoneChangeFailures = 0;
 
         try
         {
@@ -57,6 +58,7 @@ public static class SelfTest
             gaussKrugerZoneFailures = RunZoneSelectionCheck();
             datumTransformFailures = RunDatumTransformCheck();
             datumLayerFailures = RunDatumLayerCheck(samplePath);
+            zoneChangeFailures = RunZoneChangeCheck();
         }
         catch (NotImplementedException ex)
         {
@@ -77,11 +79,12 @@ public static class SelfTest
         Console.WriteLine();
         if (gaussKrugerFailures > 0 || gaussKrugerInverseFailures > 0
             || gaussKrugerScreenFailures > 0 || gaussKrugerZoneFailures > 0
-            || datumTransformFailures > 0 || datumLayerFailures > 0)
+            || datumTransformFailures > 0 || datumLayerFailures > 0 || zoneChangeFailures > 0)
         {
             Console.WriteLine($"=== 自检结束：高斯-克吕格正算 {gaussKrugerFailures} 项不符、反算 {gaussKrugerInverseFailures} 项不符、" +
                               $"接界面 {gaussKrugerScreenFailures} 项不符、选带 {gaussKrugerZoneFailures} 项不符、" +
-                              $"七参数 {datumTransformFailures} 项不符、基准图层 {datumLayerFailures} 项不符 ===");
+                              $"七参数 {datumTransformFailures} 项不符、基准图层 {datumLayerFailures} 项不符、" +
+                              $"换带 {zoneChangeFailures} 项不符 ===");
             return 4;
         }
         Console.WriteLine("=== 自检结束 ===");
@@ -305,7 +308,7 @@ public static class SelfTest
             //   ToScreen 吃的是**平面数值**，不是经纬度；对线性模式它恰好相等（恒等映射），
             //   所以漏掉这一步时只有墨卡托那列会错：把原经纬度直接喂进墨卡托的 bounds，
             //   "广州"会跑到画布外面（y=722 > 720），三对距离全都变成同一个 0.846×，
-            //   看着像"整体缩小"，其实是漏了投影。这个坑很容易踩。
+            //   看着像"整体缩小"，其实是漏了投影。这一步很容易漏。
             var (lx, ly) = lin.ToScreen(Projection.Project(p, ProjectionSettings.Linear).X, Projection.Project(p, ProjectionSettings.Linear).Y);
             var (mx, my) = mer.ToScreen(Projection.Project(p, ProjectionSettings.WebMercator).X, Projection.Project(p, ProjectionSettings.WebMercator).Y);
             screen[n] = ((lx, ly), (mx, my));
@@ -721,9 +724,9 @@ public static class SelfTest
         }
     }
 
-    // ── 第 8 段：高斯-克吕格正算（GK-1）────────────────────
+    // ── 第 8 段：高斯-克吕格正算────────────────────
     // 期望值不是我手算出来的：先用 Kruger 级数（Karney 2011 的横轴墨卡托精确解）独立算一遍，
-    // 再与课本那套 6 次级数逐点对比，两套算法相差 < 0.1 毫米才把数字写进来。
+    // 再与 6 次级数逐点对比，两套算法相差 < 0.1 毫米才把数字写进来。
     // 这样这里的 ✓ 才真的意味着"算对了"，而不是"和我抄的一样"。
     private static int RunGaussKrugerCheck()
     {
@@ -790,7 +793,7 @@ public static class SelfTest
         return failures;
     }
 
-    // ── 第 9 段：高斯-克吕格反算（GK-2）────────────────────
+    // ── 第 9 段：高斯-克吕格反算────────────────────
     // 反算的靶子分两类，容差故意不同：
     //   ① 往返：拿正算的结果反过来解，用的是全精度数值，容差 1e-9 度（≈0.1 毫米）；
     //   ② 反推 Kruger 独立算出的 (x, y)：那些数字写进第 [8] 段时只留了 4 位小数（0.1 毫米），
@@ -941,7 +944,7 @@ public static class SelfTest
             var (sx, sy) = bounds.ToScreen(x, y);
             if (sx < 0 || sx > viewportW || sy < 0 || sy > viewportH) allInView = false;
             var (rx, ry) = bounds.ToData(sx, sy);
-            // ★ 这正是 UpdateCoordinateReadout 走的路：ToData 给的是 (水平, 垂直)，反算要 (北, 东)
+            // 这正是 UpdateCoordinateReadout 走的路：ToData 给的是 (水平, 垂直)，反算要 (北, 东)
             var back = GaussKruger.Inverse(ry, rx, gk.Ellipsoid, gk.CentralMeridianDegrees);
             var err = Math.Max(Math.Abs(back.Lon - p.Lon), Math.Abs(back.Lat - p.Lat));
             if (err > worstReadout) { worstReadout = err; worstName = f.DisplayName; }
@@ -1095,8 +1098,8 @@ public static class SelfTest
 
         // ②-b 极点：p = 0 时 H = p/cosB − N 这条式子会变成 0/0 的近似，必须单独走一条路
         //     （纬度直接由 Z 的符号定，大地高用 |Z| − b）。
-        //     这一条是"自检原来根本没碰到的那一行"——加它的理由写在 GK-3A 的讲评里。
-        //     ★ 外面包一层 try：边界输入往往就是"会抛异常"的那种输入，
+        //     这一条补上的是自检原先没有覆盖到的那一行（极点附近 H 的公式退化）。
+        //     外面包一层 try：边界输入往往就是"会抛异常"的那种输入，
         //       如果不兜住，一条坏输入会把后面所有检查都掐断，反而看不出全貌。
         try
         {
@@ -1137,7 +1140,7 @@ public static class SelfTest
         ReportValue("只绕 Z：Z_t 不变", source.Z, rotateOnly.Z, 1e-6, "米");
 
         // ⑤ 整条链 + 两个边界：参数全 0 必须恒等；只换椭球不给参数则一定会挪。
-        Console.WriteLine("  -- 整条链：北京54 → CGCS2000（教学示例七参数），外加两个边界 --");
+        Console.WriteLine("  -- 整条链：北京54 → CGCS2000（示例七参数），外加两个边界 --");
         var (target, targetHeight) = DatumTransform.Transform(
             new GeoPoint(116.3975, 39.9087), 50, Ellipsoid.Beijing54, cgcs, DatumParameters.Beijing54ToCgcs2000Example);
         ReportValue("转换后 经度", 116.3998229575, target.Lon, 1e-8, "度");
@@ -1193,7 +1196,7 @@ public static class SelfTest
     }
 
     /// <summary>
-    /// [13] 基准转换到图层（GK-3B）。与 [12] 的分工：[12] 管「一个点算得对不对」，
+    /// [13] 基准转换到图层。与 [12] 的分工：[12] 管「一个点算得对不对」，
     /// 这里管「一整层对象穿过转换之后，结构、属性、方向、退化输入还对不对」。
     /// </summary>
     private static int RunDatumLayerCheck(string samplePath)
@@ -1249,7 +1252,7 @@ public static class SelfTest
         ReportTrue("北京54 → CGCS2000 挪了上百米", shiftTotal is > 100 and < 400,
             $"东 {shiftEast:0.0} 米、北 {shiftNorth:0.0} 米（合计 {shiftTotal:0.0} 米）");
 
-        // ★ 陷阱演示（下一环界面要靠它）：TransformLayer 是纯函数，但**不幂等** ——
+        // 非幂等演示（界面依赖这一点）：TransformLayer 是纯函数，但**不幂等** ——
         //   在"已经转换过"的图层上再按同一个源基准转一次，等于把偏移量又叠加一遍。
         //   所以界面必须永远从原始图层出发；写成 _layer = TransformLayer(_layer, …) 的话，
         //   下拉框来回切几次，数据就会越走越远（而且还看起来"很正常"）。
@@ -1259,13 +1262,13 @@ public static class SelfTest
         ReportTrue("在结果上再转一次 = 偏移量叠加", Math.Abs(secondShift - shiftEast) < 0.05,
             $"第二次又挪了 {secondShift:0.0} 米（第一次 {shiftEast:0.0} 米）→ 界面必须从原始图层出发");
 
-        // ★ 界面序列模拟：界面里"切源基准"=「重读下拉框 → 重新算一份显示图层」。
+        // 界面序列模拟：界面里"切源基准"=「重读下拉框 → 重新算一份显示图层」。
         //   这里把两种写法的 5 个来回都走一遍：
         //     正确（界面实际写法，输入永远是 _rawLayer）→ 来回切多少次都回到原样，误差恒为 0；
         //     错误（把上一次的结果当输入）→ 每切一次北京54 就多挪一份，5 个来回累积近 1 公里。
         //   为什么要算这个数：它给出"如果界面接错了，肉眼在 20 倍放大下该看到多大偏差"。
         GeoLayer? uiLayer = raw;       // 界面里的 _layer 的替身
-        GeoLayer? wrongLayer = raw;    // 反面教材的替身
+        GeoLayer? wrongLayer = raw;    // 反例的替身
         for (var round = 0; round < 5; round++)
         {
             uiLayer = DatumTransform.TransformLayer(raw, DatumCatalog.Beijing54, cgcs, 0);
@@ -1319,7 +1322,7 @@ public static class SelfTest
             new DatumParameters("西安80 → CGCS2000（反向）",
                 -xianParams.Dx, -xianParams.Dy, -xianParams.Dz,
                 -xianParams.Rx, -xianParams.Ry, -xianParams.Rz, -xianParams.ScalePpm));
-        // ★ 这一条原来只比经度：于是"2.6 米的纬度错误"躲在后面没被发现，红灯却是因为 0.4 毫米的经度差亮的。
+        // 这一条原来只比经度：于是"2.6 米的纬度错误"躲在后面没被发现，红灯却是因为 0.4 毫米的经度差亮的。
         //   经纬度对同一处错误的敏感度差得很远，只挑一个比等于赌运气，两轴各比一次才叫判据。
         // 容差 1e-9 度（≈0.1 毫米）还隐含一个**约定**：中转时第一腿算出的中间大地高要带进第二腿
         //   （第二腿继续用 0 会差约 1.7 毫米）；这个约定同时写在 TransformLayer 的注释里。
@@ -1347,6 +1350,85 @@ public static class SelfTest
             Console.WriteLine("      ④ 中转不符 → 两个都不是 CGCS2000 时，必须先换到 CGCS2000 再换到目标（不能跳过中间）。");
         }
 
+        return failures.Count;
+    }
+
+    /// <summary>换带（ChangeZone）与带号前缀（StripZonePrefix）。</summary>
+    private static int RunZoneChangeCheck()
+    {
+        Console.WriteLine();
+        Console.WriteLine("[14] 换带：把坐标从一条中央经线搬到另一条");
+        var failures = new List<string>();
+
+        void ReportValue(string label, double expected, double actual, double tolerance, string unit)
+        {
+            var diff = Math.Abs(expected - actual);
+            var ok = diff <= tolerance;
+            if (!ok) failures.Add(label);
+            Console.WriteLine($"    {(ok ? "✓" : "✗")} {label}：期望 {expected:0.#######} {unit}，实得 {actual:0.#######} {unit}，差 {diff:E2}（允许 {tolerance:E2}）");
+        }
+
+        void ReportTrue(string label, bool ok, string detail)
+        {
+            if (!ok) failures.Add(label);
+            Console.WriteLine($"    {(ok ? "✓" : "✗")} {label} —— {detail}");
+        }
+
+        var ellipsoid = Ellipsoid.CGCS2000;
+        // 贵阳附近的一个点：在 105° 带里 l = +1.63°（带内），在 111° 带里 l = −4.37°（出带）。
+        var guiyang = new GeoPoint { Lon = 106.6302, Lat = 26.6477 };
+        var (x105, y105) = GaussKruger.Forward(guiyang, ellipsoid, 105.0);
+
+        // ① 定义：换带 = 反算（源带）+ 正算（目标带）；和手工两步必须逐位一致。
+        var viaManual = GaussKruger.Inverse(x105, y105, ellipsoid, 105.0);
+        var (mx, my) = GaussKruger.Forward(viaManual, ellipsoid, 111.0);
+        var (cx, cy) = GaussKruger.ChangeZone(x105, y105, ellipsoid, 105.0, 111.0);
+        ReportValue("换带 = 手工「反算 + 正算」：x", mx, cx, 1e-9, "米");
+        ReportValue("换带 = 手工「反算 + 正算」：y", my, cy, 1e-9, "米");
+
+        // ② 换过去再换回来 = 回到原点。这里两头都跨了带（−4.37°），精度由级数截断决定，所以容差比带内宽松。
+        var (bx, by) = GaussKruger.ChangeZone(cx, cy, ellipsoid, 111.0, 105.0);
+        ReportValue("105° 带 → 111° 带 → 换回 105° 带：x", x105, bx, 1e-2, "米");
+        ReportValue("……：y", y105, by, 1e-2, "米");
+
+        // ③ 量级自证：相邻带的同名点差几百公里 —— 这就是「跨带必须换带」的量化理由。
+        var dy = Math.Abs(cy - y105);
+        ReportTrue("相邻带同一点 y 差 500~700 公里", dy > 500_000 && dy < 700_000,
+            $"实得 {dy / 1000:0.0} 公里（6° 带、纬度 26.6°）");
+
+        // ④ 不同的路，同一个终点：先把同一个物理点写成 3° 带（108°）的坐标，再换到 6° 带（111°），
+        //    结果必须和「105° 带 → 111° 带」一致 —— 两条路都经过同一个经纬度。
+        var (x108, y108) = GaussKruger.Forward(guiyang, ellipsoid, 108.0);
+        var (via3, vy3) = GaussKruger.ChangeZone(x108, y108, ellipsoid, 108.0, 111.0);
+        // 容差 1e-4 米（0.1 毫米）：两条路各做一次带内反算，差异只来自级数截断的尾项。
+        ReportValue("3° 带（108°）→ 6° 带（111°）与另一条路一致：x", cx, via3, 1e-4, "米");
+        ReportValue("……：y", cy, vy3, 1e-4, "米");
+
+        // ⑤ 带号前缀：20500000 是「20 带 + 东偏 500 km」的国家标准写法。
+        ReportValue("剥掉带号前缀：20500000（20 带）→", 500_000.0,
+            GaussKruger.StripZonePrefix(20_500_000.0, 20), 1e-6, "米");
+        ReportTrue("带号前缀不剥时的错误量级", Math.Abs(20_500_000.0 - GaussKruger.FalseEasting) > 10_000_000,
+            $"{Math.Abs(20_500_000.0 - GaussKruger.FalseEasting) / 1000:0} 公里（≈2000 公里）");
+
+        // ⑥ 补上去盖住"自检碰不到的那一行"：ChangeZone 里「y ≥ 1e6 就自动剥前缀」的分支。
+        //    不喂一个带前缀的 y 进来，那个 if 永远走不到 —— 上面 ①②④ 用的 y 都只有几十万。
+        //    18 带（中央经线 105°）的国家标准写法：y = 18×1e6 + 662319.6800742（同一个贵阳点）。
+        //    （第一版这条我写错了：x 取 105° 带、y 却用了 111° 带的东偏，两个带混在一起，
+        //      等于喂进去一个离中央经线约 10° 的点 —— 红灯亮得对，是判据本身错了。）
+        var prefixedY = 18_000_000.0 + y105;
+        var (prefixedX, prefixedYResult) = GaussKruger.ChangeZone(x105, prefixedY, ellipsoid, 105.0, 111.0);
+        //    容差 1e-8 米（10 纳米）而不是 1e-9：带号前缀把数值抬到 1.86×10⁷，
+        //    双精度在那个量级的最小刻度约 4×10⁻⁹ 米，剥回来必然损失几个纳米 ——
+        //    这是"带号前缀"这种**表示法**的代价，不是实现错误。（实测残差 1.46 纳米。）
+        ReportValue("带前缀的 y（18 带写法）与不带前缀结果一致：x", cx, prefixedX, 1e-8, "米");
+        ReportValue("……：y", cy, prefixedYResult, 1e-8, "米");
+
+        Console.WriteLine();
+        if (failures.Count == 0)
+        {
+            Console.WriteLine("    结论：换带 = 反算 + 正算，经纬度是唯一的中间语言；相邻带的同名点差约 600 公里，");
+            Console.WriteLine("      所以「换带」是把同一个点换一把尺子量，不是把点搬走；带号前缀另算，差的是 2000 公里。");
+        }
         return failures.Count;
     }
 

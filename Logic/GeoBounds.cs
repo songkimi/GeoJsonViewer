@@ -10,7 +10,7 @@ namespace GeoJsonViewer.Logic;
 ///
 /// 为什么这一层要单独成一个类、而不是塞进 Projection：
 ///   因为它「容易错但容易看出错」。fit 该拿哪套范围算、y 为什么反号、缩放锚点怎么补回来，
-///   坑全在这里。独立成类之后，位置不对时该查哪边一目了然：形状歪 → 查 Projection；
+///   这是这一层要负责的部分。独立成类之后，位置不对时该查哪边一目了然：形状歪 → 查 Projection；
 ///   位置偏/缩放跑 → 查这里。
 ///
 /// 投影公式（Reset / SetDataBounds 时按数据跨度算一次 baseScale，之后屏幕位置只由 zoom / pan 改）：

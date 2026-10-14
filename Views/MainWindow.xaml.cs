@@ -70,10 +70,8 @@ public partial class MainWindow : Window
 
         try
         {
-            // ★ GK-3C：读出来的这一份是「原始图层」，基准转换永远从它出发（理由见 RebuildTransformedLayer）。
+            // 读出来的这一份是「原始图层」：基准转换永远从它出发（理由见 RebuildTransformedLayer）。
             _rawLayer = GeoJsonReader.ReadFile(dialog.FileName);
-
-            
             _layer = RebuildTransformedLayer();
         }
         catch (GeoJsonException ex)
@@ -424,25 +422,36 @@ public partial class MainWindow : Window
         try
         {
             var (x, y) = _bounds.ToData(pos.X, pos.Y);
-            double lon, lat;
+            double lon, lat, nx, ny;
+            var neighbourCm = double.NaN;
             if (_settings.Mode == ProjectionMode.GaussKruger)
             {
-                // 高斯模式的平面数值单位是米，必须用反算换回经纬度。
-                // ★ GaussKruger.Inverse 要的是测绘坐标 (x 北, y 东)，而这里的 x 是"水平"、y 是"垂直"，
-                //   也就是这里的 (x, y) 恰好是 (东, 北) —— 调用时两个实参必须调过来。
+                // 高斯模式的平面数值单位是米，要反算才能得到经纬度。
+                // GaussKruger.Inverse 收的是测绘坐标 (x 北, y 东)，而这里的 x 是「水平」、y 是「垂直」，
+                // 也就是这里的 (x, y) 恰好是 (东, 北)，所以两个实参要调过来。
                 var p = GaussKruger.Inverse(y, x, _settings.Ellipsoid, _settings.CentralMeridianDegrees);
                 (lon, lat) = (p.Lon, p.Lat);
+                neighbourCm = _settings.CentralMeridianDegrees + _settings.ZoneWidthDegrees;
+                (nx, ny) = GaussKruger.ChangeZone(y, x, _settings.Ellipsoid, _settings.CentralMeridianDegrees, neighbourCm);
             }
             else
             {
                 (lon, lat) = (x, y);   // 线性模式下平面数值就等于经纬度；墨卡托模式下这里只是近似
+                (nx, ny) = (x, y);
             }
-            CursorPositionText.Text = $"光标：{lon:0.0000}, {lat:0.0000}";
+            CursorPositionText.Text = $"光标(°)：({lon:0.0000}, {lat:0.0000})";
+
+            if (!double.IsNaN(neighbourCm)
+                && lon < neighbourCm + _settings.ZoneWidthDegrees / 2
+                && lon > neighbourCm - _settings.ZoneWidthDegrees / 2)
+            {
+                CursorPositionText.Text += $"　·　东邻带中央经线 {neighbourCm}°：(东 {ny:0.0000} m，北 {nx:0.0000} m)";
+            }
         }
-        catch (NotImplementedException)
+        catch (Exception ex)
         {
-            // 视口尺寸或数据还没准备好时 ToData 可能抛异常（例如刚启动、还没打开文件），
-            // 这里吞掉，免得鼠标一动就崩。
+            // 光标读数只是显示用的信息：任何异常都不该让鼠标一动就崩掉窗口。
+            System.Diagnostics.Debug.WriteLine(ex);
         }
     }
 
