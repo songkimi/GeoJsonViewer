@@ -44,37 +44,21 @@ public static class HitTester
             var geometry = feature.Geometry;
             if (geometry.Points.Count == 0) continue;   // 坏数据不该让鼠标一动就炸
 
-            // 把每个顶点投影 → 映射到屏幕。这一步对三种几何都要做，
-            // 而且必须放在循环里逐顶点做：投影是非线性的（墨卡托），
-            // 不能在经纬度空间里先插值再投影。
-            var screenPoints = new List<Point>(geometry.Points.Count);
-            foreach (var p in geometry.Points)
+            // 单部件算一次；多部件逐个算、取最小的那个（屏幕上离鼠标最近的那一块），
+            // 这样"点在某个岛上"与"点在整条几何的边框上"判定一致。
+            double? distance = null;
+            if (geometry.Parts.Count == 0)
             {
-                var (px, py) = Projection.Project(p, settings);
-                var (sx, sy) = bounds.ToScreen(px, py);
-                screenPoints.Add(new Point(sx, sy));
+                distance = DistanceToPart(geometry.Kind, geometry.Points, settings, bounds, screen, screenX, screenY);
             }
-
-            double? distance = geometry.Kind switch
+            else
             {
-                GeometryKind.Point => Distance(screen, screenPoints[0]),
-
-                // 线：量到每一条相邻顶点连成的线段，而不是量到顶点本身。
-                // 只量顶点的话，一条长线的中段会点不中。
-                GeometryKind.LineString => MinDistanceToEdges(screen, screenPoints),
-
-                // 面：先看描边，没命中再看内部。
-                // 内部命中时距离记 0，于是它会盖过附近的点和线——这是有意的：
-                // 面里头随手点一下就应该选中这个面，而不是被边框旁边的对象抢走。
-                // 射线法在屏幕坐标系里判内外，和顶点用的是同一个坐标系，对任何投影都成立。
-                GeometryKind.Polygon => IsPointInPolygon(screenPoints, screenX, screenY)
-                    ? 0.0
-                    : MinDistanceToEdges(screen, screenPoints),
-
-                // 不认识就跳过，和 GeoJsonReader 的宽容策略保持一致
-                // （这里不该抛异常：异常留给"整个文件都用不了"的情况）
-                _ => null,
-            };
+                foreach (var part in geometry.Parts)
+                {
+                    var partDistance = DistanceToPart(geometry.Kind, part, settings, bounds, screen, screenX, screenY);
+                    if (partDistance is { } value && (distance is null || value < distance.Value)) distance = value;
+                }
+            }
 
             // 取最近的那个：若写成一命中就 return，重叠处会命中"列表里靠前的"而不是"离鼠标最近的"，
             // 表现就是"有时显示的是旁边那个对象"。
@@ -86,6 +70,50 @@ public static class HitTester
         }
 
         return best;
+    }
+
+    /// <summary>
+    /// 一个部件到鼠标的距离（屏幕像素）；不认识的几何类型、或部件为空时返回 null。
+    ///
+    /// 把每个顶点投影 → 映射到屏幕。这一步对三种几何都要做，
+    /// 而且必须放在循环里逐顶点做：投影是非线性的（墨卡托），
+    /// 不能在经纬度空间里先插值再投影。
+    /// </summary>
+    private static double? DistanceToPart(
+        GeometryKind kind, IReadOnlyList<GeoPoint> points,
+        ProjectionSettings settings, GeoBounds bounds,
+        Point screen, double screenX, double screenY)
+    {
+        if (points.Count == 0) return null;
+
+        var screenPoints = new List<Point>(points.Count);
+        foreach (var p in points)
+        {
+            var (px, py) = Projection.Project(p, settings);
+            var (sx, sy) = bounds.ToScreen(px, py);
+            screenPoints.Add(new Point(sx, sy));
+        }
+
+        return kind switch
+        {
+            GeometryKind.Point => Distance(screen, screenPoints[0]),
+
+            // 线：量到每一条相邻顶点连成的线段，而不是量到顶点本身。
+            // 只量顶点的话，一条长线的中段会点不中。
+            GeometryKind.LineString => MinDistanceToEdges(screen, screenPoints),
+
+            // 面：先看描边，没命中再看内部。
+            // 内部命中时距离记 0，于是它会盖过附近的点和线——这是有意的：
+            // 面里头随手点一下就应该选中这个面，而不是被边框旁边的对象抢走。
+            // 射线法在屏幕坐标系里判内外，和顶点用的是同一个坐标系，对任何投影都成立。
+            GeometryKind.Polygon => IsPointInPolygon(screenPoints, screenX, screenY)
+                ? 0.0
+                : MinDistanceToEdges(screen, screenPoints),
+
+            // 不认识就跳过，和 GeoJsonReader 的宽容策略保持一致
+            // （这里不该抛异常：异常留给"整个文件都用不了"的情况）
+            _ => null,
+        };
     }
 
     /// <summary>点到折线所有线段的距离里最小的那个；点数不足 2 时退化成点到点。</summary>

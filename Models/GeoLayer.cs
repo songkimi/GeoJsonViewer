@@ -51,7 +51,7 @@ public sealed class GeoLayer
 
         foreach (var f in Features)
         {
-            foreach (var p in f.Geometry.Points)
+            foreach (var p in f.Geometry.AllPoints())
             {
                 any = true;
                 if (p.Lon < minLon) minLon = p.Lon;
@@ -68,7 +68,7 @@ public sealed class GeoLayer
     public IEnumerable<GeoPoint> AllPoints()
     {
         foreach (var f in Features)
-            foreach (var p in f.Geometry.Points)
+            foreach (var p in f.Geometry.AllPoints())
                 yield return p;
     }
 }

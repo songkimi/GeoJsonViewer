@@ -26,6 +26,18 @@ public partial class MainWindow : Window
     /// </summary>
     private GeoLayer? _rawLayer;
 
+    /// <summary>
+    /// true = 正在**程序性地**改「源基准」下拉框，别把这次 SelectionChanged 当成用户操作。
+    ///
+    /// 下拉框的 SelectionChanged 分不清"用户点的"和"代码设的"。打开 shapefile 时我们要替用户选基准，
+    /// 若不放这个旗子，OnSourceDatumChanged 会插进 OnOpenClick 中间跑一次 ——
+    /// 那时 _layer 还是上一个文件的、_bounds 也还没按新文件重算，转出来是错的。
+    /// </summary>
+    private bool _suppressSourceDatumChanged;
+
+    /// <summary>.prj 给出的那句话（没有 .prj、是投影坐标系、认不出基准……）；null = 没话要说。</summary>
+    private string? _prjWarning;
+
     private GeoBounds? _bounds;
     private ProjectionSettings _settings = ProjectionSettings.Linear;
 
@@ -61,8 +73,8 @@ public partial class MainWindow : Window
     {
         var dialog = new OpenFileDialog
         {
-            Title = "打开 GeoJSON 文件",
-            Filter = "GeoJSON 文件 (*.geojson;*.json)|*.geojson;*.json|所有文件 (*.*)|*.*",
+            Title = "打开地图数据（GeoJSON / shapefile）",
+            Filter = LayerReader.BuildDialogFilter(),
             InitialDirectory = FindInitialDirectory(),
         };
 
@@ -71,7 +83,10 @@ public partial class MainWindow : Window
         try
         {
             // 读出来的这一份是「原始图层」：基准转换永远从它出发（理由见 RebuildTransformedLayer）。
-            _rawLayer = GeoJsonReader.ReadFile(dialog.FileName);
+            // 后缀分派在 Logic/LayerReader 里，窗口不再关心“这是 geojson 还是 shp”。
+            _rawLayer = LayerReader.ReadFile(dialog.FileName);
+            // 顺序要紧：.prj 说明的是"文件里的坐标是哪套基准"，所以必须先选定源基准，再转换。
+            ApplyPrjSuggestion(dialog.FileName);
             _layer = RebuildTransformedLayer();
         }
         catch (GeoJsonException ex)
@@ -80,6 +95,7 @@ public partial class MainWindow : Window
             _layer = null;
             _rawLayer = null;
             _bounds = null;
+            _prjWarning = null;
             MapCanvas.Children.Clear();
             HoverTip.Visibility = Visibility.Collapsed;
             ShowMessage(ex.Message);
@@ -90,6 +106,7 @@ public partial class MainWindow : Window
         {
             // 兜底：任何没预料到的异常也变成一行提示，绝不让窗口崩掉。
             _rawLayer = null;
+            _prjWarning = null;
             ShowMessage($"打开文件时出了意外：{ex.Message}");
             StatusText.Text = "打开失败";
             return;
@@ -117,6 +134,34 @@ public partial class MainWindow : Window
     {
         var samples = Path.Combine(AppContext.BaseDirectory, "Samples");
         return Directory.Exists(samples) ? samples : AppContext.BaseDirectory;
+    }
+
+    /// <summary>
+    /// 打开 .shp 时读旁边的 .prj：能认出来就把「源基准」替用户选好，认不出/是投影/没有声明就只留一句话。
+    ///
+    /// 只有 .shp 才有 .prj（GeoJSON 的坐标系写在标准里，永远是 WGS84 经纬度）。
+    /// </summary>
+    private void ApplyPrjSuggestion(string filePath)
+    {
+        _prjWarning = null;
+        if (!string.Equals(Path.GetExtension(filePath), ".shp", StringComparison.OrdinalIgnoreCase)) return;
+
+        var suggestion = PrjSuggestion.For(PrjReader.TryRead(filePath));
+        _prjWarning = suggestion.Warning;
+        if (suggestion.Datum is null) return;
+
+        var index = Array.IndexOf(DatumCatalog.All, suggestion.Datum);
+        if (index < 0 || SourceDatumBox.SelectedIndex == index) return;
+
+        _suppressSourceDatumChanged = true;
+        try
+        {
+            SourceDatumBox.SelectedIndex = index;
+        }
+        finally
+        {
+            _suppressSourceDatumChanged = false;
+        }
     }
 
     // ───────────────────────── 基准（基准 ≠ 椭球） ─────────────────────────
@@ -149,6 +194,9 @@ public partial class MainWindow : Window
     {
         // XAML 是一个节点一个节点解析的：这个下拉框在窗口构造时也会触发一次 —— 那时还没有文件。
         if (_rawLayer is null) return;
+
+        // 程序性改选（ApplyPrjSuggestion 里）不需要在这里再做一遍转换 —— 调用方会按正确顺序接着做。
+        if (_suppressSourceDatumChanged) return;
         _layer = RebuildTransformedLayer();
         _bounds = new GeoBounds(ProjectAllPoints());
         _bounds.Reset(MapCanvas.ActualWidth, MapCanvas.ActualHeight);
@@ -411,6 +459,11 @@ public partial class MainWindow : Window
                 text += "　·　警告：该文件的经纬度边界不在当前投影带内";
             }
         }
+        if (_prjWarning is not null)
+        {
+            text += $"　·　{_prjWarning}";
+        }
+
         StatusText.Text = text;
     }
 

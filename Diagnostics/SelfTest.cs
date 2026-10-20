@@ -42,6 +42,10 @@ public static class SelfTest
         var datumTransformFailures = 0;
         var datumLayerFailures = 0;
         var zoneChangeFailures = 0;
+        var shapefileFailures = 0;
+        var layerReaderFailures = 0;
+        var prjFailures = 0;
+        var prjSuggestionFailures = 0;
 
         try
         {
@@ -59,6 +63,10 @@ public static class SelfTest
             datumTransformFailures = RunDatumTransformCheck();
             datumLayerFailures = RunDatumLayerCheck(samplePath);
             zoneChangeFailures = RunZoneChangeCheck();
+            shapefileFailures = RunShapefileCheck();
+            layerReaderFailures = RunLayerReaderCheck(samplePath);
+            prjFailures = RunPrjCheck(samplePath);
+            prjSuggestionFailures = RunPrjSuggestionCheck();
         }
         catch (NotImplementedException ex)
         {
@@ -79,12 +87,15 @@ public static class SelfTest
         Console.WriteLine();
         if (gaussKrugerFailures > 0 || gaussKrugerInverseFailures > 0
             || gaussKrugerScreenFailures > 0 || gaussKrugerZoneFailures > 0
-            || datumTransformFailures > 0 || datumLayerFailures > 0 || zoneChangeFailures > 0)
+            || datumTransformFailures > 0 || datumLayerFailures > 0 || zoneChangeFailures > 0
+            || shapefileFailures > 0 || layerReaderFailures > 0 || prjFailures > 0 || prjSuggestionFailures > 0)
         {
             Console.WriteLine($"=== 自检结束：高斯-克吕格正算 {gaussKrugerFailures} 项不符、反算 {gaussKrugerInverseFailures} 项不符、" +
                               $"接界面 {gaussKrugerScreenFailures} 项不符、选带 {gaussKrugerZoneFailures} 项不符、" +
                               $"七参数 {datumTransformFailures} 项不符、基准图层 {datumLayerFailures} 项不符、" +
-                              $"换带 {zoneChangeFailures} 项不符 ===");
+                              $"换带 {zoneChangeFailures} 项不符、shapefile {shapefileFailures} 项不符、" +
+                              $"读取分派 {layerReaderFailures} 项不符、prj 声明 {prjFailures} 项不符、" +
+                              $"基准建议 {prjSuggestionFailures} 项不符 ===");
             return 4;
         }
         Console.WriteLine("=== 自检结束 ===");
@@ -1447,6 +1458,518 @@ public static class SelfTest
     {
         var (dx, dy) = bounds.ToData(anchorX, anchorY);
         return Math.Max(Math.Abs(dx - expected.X), Math.Abs(dy - expected.Y));
+    }
+
+    /// <summary>
+    /// [15] shapefile：读现成数据（Natural Earth 110m 国家），对的是裸读 .shp 字节算出来的数字。
+    ///
+    /// 为什么用这个文件当判据：177 条记录 / 10,654 个顶点 / 文件头 bbox 这三样，
+    /// 是先按 shapefile 规范用 struct 直接读字节得到的（不经过任何 GIS 库），
+    /// 所以它们同时钉住"记录数、顶点数、范围"——哪一处读错都会露馅。
+    /// 数据不在（TestData 没下载）就打印跳过，不让自检因为"没数据"变红。
+    /// </summary>
+    private static int RunShapefileCheck()
+    {
+        Console.WriteLine();
+        Console.WriteLine("[15] shapefile：读 .shp/.dbf（对的是裸读字节算出来的记录数/顶点数/范围）");
+
+        var failures = new List<string>();
+
+        void ReportValue(string label, double expected, double actual, double tolerance, string unit)
+        {
+            var diff = Math.Abs(expected - actual);
+            var ok = diff <= tolerance;
+            if (!ok) failures.Add(label);
+            Console.WriteLine($"    {(ok ? "✓" : "✗")} {label}：期望 {expected:0.#######} {unit}，实得 {actual:0.#######} {unit}，差 {diff:E2}（允许 {tolerance:E2}）");
+        }
+
+        void ReportTrue(string label, bool ok, string detail)
+        {
+            if (!ok) failures.Add(label);
+            Console.WriteLine($"    {(ok ? "✓" : "✗")} {label} —— {detail}");
+        }
+
+        var root = ResolveTestDataRoot();
+        if (root is null)
+        {
+            Console.WriteLine("    - 没找到 TestData 目录（真实数据不随仓库上传），跳过这一段");
+            return 0;
+        }
+
+        var countriesPath = Path.Combine(root, "naturalearth", "ne_110m_admin_0_countries", "ne_110m_admin_0_countries.shp");
+        if (!File.Exists(countriesPath))
+        {
+            Console.WriteLine("    - 没找到 Natural Earth 110m 国家数据，跳过这一段");
+            return 0;
+        }
+
+        var layer = ShapefileReader.ReadFile(countriesPath);
+        ReportTrue("文件名保真", layer.FileName == "ne_110m_admin_0_countries.shp", $"「{layer.FileName}」");
+        ReportTrue("记录数 177", layer.Features.Count == 177, $"{layer.Features.Count} 条（.shx 反推 177 条）");
+        ReportTrue("一条没丢", layer.SkippedCount == 0, $"跳过 {layer.SkippedCount} 条");
+
+        // 顶点总数：多部件要是被漏掉、或者被数了两次，这个数字立刻不对。
+        // 10,642 = 只数外环。全环是 10,654，差的 12 个顶点在洞里 —— 洞暂时不画（见 ToGeometry 的说明）。
+        var vertexCount = layer.AllPoints().Count();
+        ReportTrue("顶点总数 10,642（只算外环；多部件既不丢也不重复数）", vertexCount == 10642, $"{vertexCount} 个");
+
+        if (layer.LonLatBounds is { } bounds)
+        {
+            ReportValue("西界 MinLon", -180.0, bounds.MinLon, 1e-9, "度");
+            ReportValue("南界 MinLat", -90.0, bounds.MinLat, 1e-9, "度");
+            ReportValue("东界 MaxLon", 180.00000000000006, bounds.MaxLon, 1e-9, "度");
+            ReportValue("北界 MaxLat", 83.64513000000001, bounds.MaxLat, 1e-9, "度");
+        }
+        else
+        {
+            ReportTrue("经纬度范围非空", false, "一层 177 个国家不可能没有范围");
+        }
+
+        // 属性：字段名可能是 NAME / name，GetProperty 做了忽略大小写的兜底，两种都该取到 Fiji。
+        var first = layer.Features[0];
+        ReportTrue("首条 name = Fiji", first.GetProperty("name") == "Fiji", $"name = 「{first.GetProperty("name")}」");
+
+        // 首条在 shapefile 里是 MultiPolygon（斐济：3 块），所以 Parts 必须保住 3 块、合计 22 个顶点。
+        var parts = first.Geometry.Parts;
+        ReportTrue("首条 3 个部件", parts.Count == 3, $"{parts.Count} 个部件");
+        ReportTrue("首条合计 22 个顶点", parts.Sum(p => p.Count) == 22, $"{parts.Sum(p => p.Count)} 个顶点");
+
+        // 策略真的传进库里了吗：10m 省级数据里有 1 条不合规多边形，
+        // 五种策略留下的东西各不相同 —— 这是"选项有没有接上"最硬的证据。
+        var provincesPath = Path.Combine(root, "naturalearth", "ne_10m_admin_1_states_provinces", "ne_10m_admin_1_states_provinces.shp");
+        if (File.Exists(provincesPath))
+        {
+            Console.WriteLine("    （下面要读 4 次 35 MB 的数据，这一段慢是正常的）");
+
+            var strictMessage = "(没抛异常)";
+            try
+            {
+                ShapefileReader.ReadFile(provincesPath, new ShapefileReadOptions(ShapefileGeometryPolicy.Strict));
+            }
+            catch (Exception ex)
+            {
+                strictMessage = $"{ex.GetType().Name}: {ex.Message}";
+            }
+
+            ReportTrue("Strict：不合规几何直接抛异常", strictMessage.StartsWith("ShapefileException", StringComparison.Ordinal), strictMessage);
+
+            var ignore = ShapefileReader.ReadFile(provincesPath, new ShapefileReadOptions(ShapefileGeometryPolicy.IgnoreInvalid));
+            var skip = ShapefileReader.ReadFile(provincesPath, new ShapefileReadOptions(ShapefileGeometryPolicy.SkipInvalid));
+            var quick = ShapefileReader.ReadFile(provincesPath, new ShapefileReadOptions(ShapefileGeometryPolicy.QuickFixInvalid));
+
+            ReportTrue("IgnoreInvalid：4,596 条全留（只删掉坏环）",
+                ignore.Features.Count == 4596 && ignore.SkippedCount == 0,
+                $"{ignore.Features.Count} 条、跳过 {ignore.SkippedCount} 条");
+            ReportTrue("SkipInvalid：整条丢掉，只剩 4,595 条",
+                skip.Features.Count == 4595 && skip.SkippedCount == 1,
+                $"{skip.Features.Count} 条、跳过 {skip.SkippedCount} 条");
+            ReportTrue("QuickFix：库给 4,596 条，其中 1 条被修成空几何 → 也得丢掉（4,595 条）",
+                quick.Features.Count == 4595 && quick.SkippedCount == 1,
+                $"{quick.Features.Count} 条、跳过 {quick.SkippedCount} 条");
+        }
+        else
+        {
+            Console.WriteLine("    - 没找到 10m 省级数据，跳过策略对比（这一项要读 35 MB，本来就慢）");
+        }
+
+        Console.WriteLine();
+        if (failures.Count == 0)
+        {
+            Console.WriteLine("    结论：记录数、顶点数、经纬度范围、属性键值、多部件边界五样都对上了；");
+            Console.WriteLine("      而且「几何不合规怎么办」这个选项确实传到了库里面（两种策略的记录数不一样）。");
+        }
+        else
+        {
+            Console.WriteLine($"    有 {failures.Count} 项不符。按这个顺序查：");
+            Console.WriteLine("      ① 记录数/顶点数不对 → 是不是 Multi* 只取了第一块，或者把多个部件串成了一条？");
+            Console.WriteLine("         （顶点数若是 10,654，说明连洞（InteriorRing）也塞进部件里了 —— 洞会被画成实心面）");
+            Console.WriteLine("      ② 范围不对 → 顶点的 (X, Y) 有没有写反？多部件的点有没有参与范围计算？");
+            Console.WriteLine("      ③ 属性取不到 → 字段名大小写、或值的字符串化失败了；");
+            Console.WriteLine("      ④ 策略对比不对 → ToLibraryMode 的五项映射有没有错位（比如 Skip 和 Ignore 对调），");
+            Console.WriteLine("         或者忘了丢掉库修出来的空几何（QuickFix 那条会变成空几何）。");
+        }
+
+        return failures.Count;
+    }
+
+    /// <summary>
+    /// [17] .prj 声明：WKT → 「经纬度还是平面 / 哪套基准 / 哪个椭球」。
+    ///
+    /// 为什么值得单测：坐标数字本身永远不会告诉你它是 WGS84 还是 CGCS2000，
+    /// 而这个判断错了，后面的投影、七参数、换带全都建立在错的起点上。
+    /// 这里用一段真实文件的 .prj + 几段手写 WKT，把四种基准和两种坐标系都走一遍。
+    /// </summary>
+    private static int RunPrjCheck(string samplePath)
+    {
+        Console.WriteLine();
+        Console.WriteLine("[17] .prj 声明：WKT → 坐标系类型 / 基准 / 椭球");
+
+        var failures = 0;
+
+        void Report(string label, bool ok, string detail)
+        {
+            Console.WriteLine($"    {(ok ? "✓" : "✗")} {label} —— {detail}");
+            if (!ok) failures++;
+        }
+
+        static bool Near(double? actual, double expected, double tolerance)
+            => actual is { } v && Math.Abs(v - expected) < tolerance;
+
+        // ① 磁盘上真实的 .prj（Natural Earth 全是 WGS84 经纬度）
+        var dataRoot = ResolveTestDataRoot();
+        var shpPath = dataRoot is null
+            ? null
+            : Path.Combine(dataRoot, "naturalearth", "ne_110m_admin_0_countries", "ne_110m_admin_0_countries.shp");
+        if (shpPath is not null && File.Exists(shpPath))
+        {
+            var info = PrjReader.TryRead(shpPath);
+            if (info is null)
+            {
+                Report("真实 .prj 能读出来", false, "TryRead 返回了 null");
+            }
+            else
+            {
+                Report("真实 .prj：是地理坐标系", !info.IsProjected, info.IsProjected ? "被认成投影坐标系了" : "GEOGCS");
+                Report("真实 .prj：基准名 D_WGS_1984",
+                       string.Equals(info.DatumName, "D_WGS_1984", StringComparison.OrdinalIgnoreCase),
+                       $"「{info.DatumName}」");
+                Report("真实 .prj：长半轴 6378137", Near(info.SemiMajorAxis, 6378137.0, 1e-6), $"{info.SemiMajorAxis}");
+                Report("真实 .prj：扁率倒数 298.257223563", Near(info.InverseFlattening, 298.257223563, 1e-9),
+                       $"{info.InverseFlattening}");
+
+                var match = PrjReader.MatchDatum(info);
+                Report("真实 .prj：认出 WGS84，且是按名字认的",
+                       match is { FromName: true } m && m.Datum.Name == DatumCatalog.Wgs84.Name,
+                       match is null ? "没认出来" : $"{match.Value.Datum.Name}（FromName = {match.Value.FromName}）");
+            }
+        }
+        else
+        {
+            Console.WriteLine("    - 没找到 110m 国家数据，跳过“真实 .prj”这一组（TestData 不进版本库）");
+        }
+
+        // ② 没有 .prj 的文件：不该抛异常，只该说“不知道”
+        var missing = PrjReader.TryRead(samplePath);
+        Report("没有 .prj 的路径 → null", missing is null,
+               missing is null ? "返回 null（不知道，但也没炸）" : "返回了非 null");
+
+        // ③④⑤⑥ 四种基准 + 一种投影坐标系，用标准 WKT 走一遍
+        const string wgs84 = "GEOGCS[\"GCS_WGS_1984\",DATUM[\"D_WGS_1984\",SPHEROID[\"WGS_1984\",6378137.0,298.257223563]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]]";
+        const string cgcs2000 = "GEOGCS[\"GCS_China_Geodetic_Coordinate_System_2000\",DATUM[\"D_China_2000\",SPHEROID[\"CGCS2000\",6378137.0,298.257222101]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]]";
+        const string beijing54 = "GEOGCS[\"GCS_Beijing_1954\",DATUM[\"D_Beijing_1954\",SPHEROID[\"Krasovsky_1940\",6378245.0,298.3]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]]";
+        const string xian80 = "GEOGCS[\"GCS_Xian_1980\",DATUM[\"D_Xian_1980\",SPHEROID[\"Xian_1980\",6378140.0,298.257]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]]";
+        const string cgcs2000Gk = "PROJCS[\"CGCS2000_3_Degree_GK_Zone_36\",GEOGCS[\"GCS_China_Geodetic_Coordinate_System_2000\",DATUM[\"D_China_2000\",SPHEROID[\"CGCS2000\",6378137.0,298.257222101]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]],PROJECTION[\"Gauss_Kruger\"],PARAMETER[\"False_Easting\",36500000.0],PARAMETER[\"False_Northing\",0.0],PARAMETER[\"Central_Meridian\",108.0],PARAMETER[\"Scale_Factor\",1.0],PARAMETER[\"Latitude_Of_Origin\",0.0],UNIT[\"Meter\",1.0]]";
+
+        void CheckDatum(string label, string wkt, Datum expected)
+        {
+            var info = PrjReader.Parse(wkt);
+            var match = info is null ? null : PrjReader.MatchDatum(info);
+            Report(label,
+                   match is { FromName: true } m && m.Datum.Name == expected.Name,
+                   info is null
+                       ? "Parse 返回 null"
+                       : match is null
+                           ? $"没认出来（基准名「{info.DatumName}」、椭球「{info.SpheroidName}」）"
+                           : $"{match.Value.Datum.Name}（FromName = {match.Value.FromName}）");
+        }
+
+        CheckDatum("WGS84 经纬度 → WGS84", wgs84, DatumCatalog.Wgs84);
+        CheckDatum("CGCS2000 经纬度 → CGCS2000", cgcs2000, DatumCatalog.Cgcs2000);
+        CheckDatum("北京54 经纬度 → 北京54", beijing54, DatumCatalog.Beijing54);
+        CheckDatum("西安80 经纬度 → 西安80", xian80, DatumCatalog.Xian80);
+
+        var gk = PrjReader.Parse(cgcs2000Gk);
+        Report("CGCS2000 高斯投影：内层 GEOGCS 不算数，整体是投影坐标系",
+               gk is { IsProjected: true }, gk is null ? "Parse 返回 null" : $"IsProjected = {gk.IsProjected}");
+        Report("CGCS2000 高斯投影：椭球仍能取到 6378137 / 298.257222101",
+               gk is not null && Near(gk.SemiMajorAxis, 6378137.0, 1e-6) && Near(gk.InverseFlattening, 298.257222101, 1e-9),
+               gk is null ? "Parse 返回 null" : $"a = {gk.SemiMajorAxis}、1/f = {gk.InverseFlattening}");
+
+        // ⑦ 名字认不出（基准名和椭球名都不含任何线索）、只能靠椭球数字猜：必须如实说“这是猜的”
+        const string unknownDatum = "GEOGCS[\"GCS_Unknown\",DATUM[\"D_Something_Else\",SPHEROID[\"Ellipsoid_1\",6378137.0,298.257223563]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]]";
+        var unknownInfo = PrjReader.Parse(unknownDatum);
+        var unknownMatch = unknownInfo is null ? null : PrjReader.MatchDatum(unknownInfo);
+        Report("名字认不出 → 退回椭球匹配，并标记为“猜的”",
+               unknownMatch is { FromName: false } um && um.Datum.Name == DatumCatalog.Wgs84.Name,
+               unknownMatch is null ? "没认出来" : $"{unknownMatch.Value.Datum.Name}（FromName = {unknownMatch.Value.FromName}）");
+
+        // ⑧ 排版恶劣：只到 ProjNET 能容忍的那几种 —— 换行、多空格、制表符、数字不带小数点。
+        //    实测（TestData\probe\MessyProbe）：这四种它全接受，唯独"关键字小写"不认。
+        const string messyLayout = "GEOGCS [ \"GCS_WGS_1984\" ,\r\n\tDATUM [ \"D_WGS_1984\" ,\r\n\t\tSPHEROID [ \"WGS_1984\" , 6378137 , 298.257223563 ] ] ,\r\n\tPRIMEM [ \"Greenwich\" , 0 ] ,\r\n\tUNIT [ \"Degree\" , 0.0174532925199433 ] ]";
+        var messyInfo = PrjReader.Parse(messyLayout);
+        Report("排版恶劣（换行/多空格/制表符/整数写法）也认得出",
+               messyInfo is not null && !messyInfo.IsProjected
+               && Near(messyInfo.SemiMajorAxis, 6378137.0, 1e-6)
+               && Near(messyInfo.InverseFlattening, 298.257223563, 1e-9),
+               messyInfo is null ? "Parse 返回 null" : $"a = {messyInfo.SemiMajorAxis}、1/f = {messyInfo.InverseFlattening}");
+
+        // ⑧b 小写关键字：ProjNET 大小写敏感，明确要求返回 null。
+        //     这不是 bug，是把库的边界"钉"下来，免得以后有人把它当 bug 去"修"。
+        const string lowercaseKeywords = "geogcs[\"GCS_WGS_1984\",DATUM[\"D_WGS_1984\",SPHEROID[\"WGS_1984\",6378137.0,298.257223563]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]]";
+        var lowercaseInfo = PrjReader.Parse(lowercaseKeywords);
+        Report("小写关键字 → 返回 null（ProjNET 大小写敏感；真实 .prj 由软件生成，一律大写）",
+               lowercaseInfo is null,
+               lowercaseInfo is null ? "null" : "居然认出来了 —— 是不是加了归一化？");
+
+        // ⑨ 根本不是 WKT：返回 null，不抛异常
+        var garbage = PrjReader.Parse("这不是 WKT，只是一句中文");
+        Report("不是 WKT → 返回 null 而不是抛异常", garbage is null, garbage is null ? "null" : "返回了非 null");
+        var empty = PrjReader.Parse("   ");
+        Report("空字符串 → 返回 null", empty is null, empty is null ? "null" : "返回了非 null");
+
+        Console.WriteLine();
+        if (failures == 0)
+        {
+            Console.WriteLine("    结论：真实 .prj 与四套基准的 WKT 都能认出来，投影坐标系没被内层 GEOGCS 骗到，");
+            Console.WriteLine("      名字缺失时老实退回椭球匹配并标记“猜的”，坏输入不抛异常。");
+        }
+        else
+        {
+            Console.WriteLine($"    有 {failures} 项不符。按这个顺序查：");
+            Console.WriteLine("      ① 是不是被内层 GEOGCS 骗了（投影 WKT 里也有 GEOGCS，要比较两者谁在前）；");
+            Console.WriteLine("      ② 引号串取错了（DATUM 后面第一个引号串才是名字，别取到 PROJCS 的名字）；");
+            Console.WriteLine("      ③ 数字解析没用 InvariantCulture（逗号是分隔符，区域设置一变小数点就变逗号）；");
+            Console.WriteLine("      ④ 小写关键字 ProjNET 不认（它大小写敏感）—— 小写归入“认不出”，不算错。");
+        }
+
+        return failures;
+    }
+
+    /// <summary>
+    /// [18] .prj → 「源基准」建议：什么时候替用户选，什么时候只提示。
+    /// </summary>
+    private static int RunPrjSuggestionCheck()
+    {
+        Console.WriteLine();
+        Console.WriteLine("[18] .prj → 源基准建议（认得出才改，认不出只提示）");
+        var failures = 0;
+
+        void Report(string label, bool ok, string detail)
+        {
+            Console.WriteLine($"      {(ok ? "✓" : "✗")} {label} —— {detail}");
+            if (!ok) failures++;
+        }
+
+        const string wgs84 = "GEOGCS[\"GCS_WGS_1984\",DATUM[\"D_WGS_1984\",SPHEROID[\"WGS_1984\",6378137.0,298.257223563]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]]";
+        const string beijing54WithToWgs84 = "GEOGCS[\"GCS_Beijing_1954\",DATUM[\"D_Beijing_1954\",SPHEROID[\"Krasovsky_1940\",6378245.0,298.3],TOWGS84[-110.0,-41.0,-24.0,1.5,-1.2,2.0,3.5]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]]";
+        const string projected = "PROJCS[\"CGCS2000_3_Degree_GK_Zone_36\",GEOGCS[\"GCS_China_Geodetic_Coordinate_System_2000\",DATUM[\"D_China_2000\",SPHEROID[\"CGCS2000\",6378137.0,298.257222101]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]],PROJECTION[\"Gauss_Kruger\"],PARAMETER[\"False_Easting\",36500000.0],PARAMETER[\"False_Northing\",0.0],PARAMETER[\"Central_Meridian\",108.0],PARAMETER[\"Scale_Factor\",1.0],PARAMETER[\"Latitude_Of_Origin\",0.0],UNIT[\"Meter\",1.0]]";
+        // 椭球故意取一个四套基准都对不上的值：否则 [17] ⑦ 那条"退回椭球匹配"会让这里也认成 WGS84。
+        const string unknownDatum = "GEOGCS[\"GCS_Unknown\",DATUM[\"D_Something_Else\",SPHEROID[\"Odd_Ellipsoid\",6378000.0,299.0]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]]";
+
+        var wgsInfo = PrjReader.Parse(wgs84);
+        var wgsSuggestion = wgsInfo is null ? null : PrjSuggestion.For(wgsInfo);
+        Report("WGS84 声明 → 建议源基准 WGS84、没有警告",
+               wgsSuggestion is { Datum: not null, Warning: null } ws && ws.Datum.Name == DatumCatalog.Wgs84.Name,
+               wgsSuggestion is null ? "For 返回 null" : $"{wgsSuggestion.Datum?.Name ?? "null"} / 警告 = {wgsSuggestion.Warning ?? "null"}");
+
+        var bjInfo = PrjReader.Parse(beijing54WithToWgs84);
+        var bjSuggestion = bjInfo is null ? null : PrjSuggestion.For(bjInfo);
+        Report("带 TOWGS84 → HasToWgs84 = true、建议北京54",
+               bjSuggestion is { Datum: not null, HasToWgs84: true } bs && bs.Datum.Name == DatumCatalog.Beijing54.Name,
+               bjSuggestion is null ? "For 返回 null" : $"HasToWgs84 = {bjSuggestion.HasToWgs84}、{bjSuggestion.Datum?.Name ?? "null"}");
+
+        var gkInfo = PrjReader.Parse(projected);
+        var gkSuggestion = gkInfo is null ? null : PrjSuggestion.For(gkInfo);
+        var gkWarning = gkSuggestion?.Warning;
+        Report("投影坐标系 → 不给建议，但要有一句提示",
+               gkSuggestion is { Datum: null } && !string.IsNullOrWhiteSpace(gkWarning),
+               gkSuggestion is null ? "For 返回 null" : $"{gkSuggestion.Datum?.Name ?? "null"} / {gkWarning ?? "null"}");
+
+        var unknownInfo = PrjReader.Parse(unknownDatum);
+        var unknownSuggestion = unknownInfo is null ? null : PrjSuggestion.For(unknownInfo);
+        var unknownWarning = unknownSuggestion?.Warning;
+        Report("认不出基准 → 不给建议，但要有一句提示",
+               unknownSuggestion is { Datum: null } && !string.IsNullOrWhiteSpace(unknownWarning),
+               unknownSuggestion is null ? "For 返回 null" : $"{unknownSuggestion.Datum?.Name ?? "null"} / {unknownWarning ?? "null"}");
+
+        var noneSuggestion = PrjSuggestion.For(null);
+        var noneWarning = noneSuggestion.Warning;
+        Report("没有 .prj → 不给建议，但要有一句提示",
+               noneSuggestion is { Datum: null } && !string.IsNullOrWhiteSpace(noneWarning),
+               $"{noneSuggestion.Datum?.Name ?? "null"} / {noneWarning ?? "null"}");
+
+        // 三句提示是给操作员看的：三种「不改」的原因必须能区分开，否则他只知道「没识别出基准」，
+        // 分不清是数据本来就是米、还是这套基准没见过、还是压根没有声明。
+        var distinctWarnings = new[] { gkWarning, unknownWarning, noneWarning }
+            .Where(w => !string.IsNullOrWhiteSpace(w))
+            .Distinct(StringComparer.Ordinal)
+            .Count();
+        Report("三种「不改」的原因 → 三句提示互不相同",
+               distinctWarnings == 3,
+               distinctWarnings == 3 ? "三句均不同" : $"只有 {distinctWarnings} 种不同的提示");
+
+        // 名字认不出、但椭球参数正好等于某一套基准 —— 这时只能"猜"，猜对了也必须说明是猜的。
+        var guessedInfo = PrjReader.Parse("GEOGCS[\"GCS_Ambiguous\",DATUM[\"D_Ambiguous\",SPHEROID[\"Ellipsoid_1\",6378137.0,298.257223563]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]]");
+        var guessedSuggestion = guessedInfo is null ? null : PrjSuggestion.For(guessedInfo);
+        Report("只对上椭球参数 → 给建议，但 FromName = false 且要说明是猜的",
+               guessedSuggestion is { Datum: not null, FromName: false, HasToWgs84: false } guess
+               && guess.Datum.Name == DatumCatalog.Wgs84.Name
+               && !string.IsNullOrWhiteSpace(guess.Warning),
+               guessedSuggestion is null
+                   ? "For 返回 null"
+                   : $"{guessedSuggestion.Datum?.Name ?? "null"} / FromName = {guessedSuggestion.FromName} / HasToWgs84 = {guessedSuggestion.HasToWgs84} / {guessedSuggestion.Warning ?? "null"}");
+
+        // HasToWgs84 是"原样透传"，不是"我认得出来就写 true" —— 投影坐标系也可能带 TOWGS84。
+        // （TOWGS84 必须写在 DATUM 里面；写在 GEOGCS 外面就成了非法 WKT，Parse 会按契约返回 null。）
+        const string projectedWithToWgs84 = "PROJCS[\"CGCS2000_3_Degree_GK_Zone_36\",GEOGCS[\"GCS_China_Geodetic_Coordinate_System_2000\",DATUM[\"D_China_2000\",SPHEROID[\"CGCS2000\",6378137.0,298.257222101],TOWGS84[-110.0,-41.0,-24.0,1.5,-1.2,2.0,3.5]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]],PROJECTION[\"Gauss_Kruger\"],PARAMETER[\"False_Easting\",36500000.0],PARAMETER[\"False_Northing\",0.0],PARAMETER[\"Central_Meridian\",108.0],PARAMETER[\"Scale_Factor\",1.0],PARAMETER[\"Latitude_Of_Origin\",0.0],UNIT[\"Meter\",1.0]]";
+        var ptwInfo = PrjReader.Parse(projectedWithToWgs84);
+        var ptwSuggestion = ptwInfo is null ? null : PrjSuggestion.For(ptwInfo);
+        Report("投影坐标系 + TOWGS84 → HasToWgs84 原样透传 = true",
+               ptwSuggestion is { Datum: null, HasToWgs84: true },
+               ptwSuggestion is null
+                   ? "For 返回 null"
+                   : $"{ptwSuggestion.Datum?.Name ?? "null"} / HasToWgs84 = {ptwSuggestion.HasToWgs84}");
+
+        Console.WriteLine();
+        if (failures == 0)
+        {
+            Console.WriteLine("    结论：.prj 认得出就选基准，是投影/认不出/没有声明就只提示 —— 不擅自改用户的设置。");
+        }
+        else
+        {
+            Console.WriteLine($"    有 {failures} 项不符。按这个顺序查：");
+            Console.WriteLine("      ① 三种「不改」的分支是不是都给了非空的 Warning（空串不算）；");
+            Console.WriteLine("      ② IsProjected 的判断是不是在 MatchDatum 之前（投影坐标系的坐标是米，认基准没意义）；");
+            Console.WriteLine("      ③ 三句提示是不是写成了同一句 —— 操作员要靠它区分「数据是米 / 基准没见过 / 压根没声明」。");
+        }
+
+        return failures;
+    }
+
+    /// <summary>
+    ///
+    /// 这一段存在的理由：界面里"按后缀走哪条路"的分支自检碰不到，
+    /// 而那正是最容易出现「切了没反应」的地方。把分派搬进 Logic 之后，它就能被自检直接点名。
+    /// </summary>
+    private static int RunLayerReaderCheck(string samplePath)
+    {
+        Console.WriteLine();
+        Console.WriteLine("[16] 打开文件：按扩展名分派到 GeoJSON / shapefile 两条读路径");
+
+        var failures = 0;
+
+        void Report(string label, bool ok, string detail)
+        {
+            Console.WriteLine($"    {(ok ? "✓" : "✗")} {label} —— {detail}");
+            if (!ok) failures++;
+        }
+
+        // ① .geojson：走 GeoJsonReader 那条老路
+        var geo = LayerReader.ReadFile(samplePath);
+        Report("GeoJSON 走 GeoJSON 那条路", geo.Features.Count == 5, $"{geo.Features.Count} 条对象");
+        Report("文件名保真", geo.FileName == Path.GetFileName(samplePath), $"「{geo.FileName}」");
+
+        // ② .shp：走 ShapefileReader
+        var dataRoot = ResolveTestDataRoot();
+        var shpPath = dataRoot is null
+            ? null
+            : Path.Combine(dataRoot, "naturalearth", "ne_110m_admin_0_countries", "ne_110m_admin_0_countries.shp");
+        if (shpPath is not null && File.Exists(shpPath))
+        {
+            var shp = LayerReader.ReadFile(shpPath);
+            Report("shapefile 走 shapefile 那条路", shp.Features.Count == 177,
+                   $"{shp.Features.Count} 条对象、跳过 {shp.SkippedCount} 条");
+        }
+        else
+        {
+            Console.WriteLine("    - 没找到 110m 国家数据，跳过 shapefile 分派（TestData 不进版本库）");
+        }
+
+        // ③ 调用方给的读选项，有没有真的传到库里。
+        //    这一条专门盯“参数半路被丢掉”：函数签名收下了 shapefileOptions，但调库时没带上，
+        //    默认策略会把数据读出来、一切看起来正常，只有这里能看出来。
+        var strictPath = dataRoot is null
+            ? null
+            : Path.Combine(dataRoot, "naturalearth", "ne_10m_admin_1_states_provinces", "ne_10m_admin_1_states_provinces.shp");
+        if (strictPath is not null && File.Exists(strictPath))
+        {
+            var strictThrew = false;
+            var strictMessage = "";
+            try
+            {
+                LayerReader.ReadFile(strictPath, new ShapefileReadOptions(ShapefileGeometryPolicy.Strict));
+            }
+            catch (Exception ex)
+            {
+                strictThrew = ex.GetType().Name == "ShapefileException";
+                strictMessage = strictThrew ? ex.Message : $"{ex.GetType().Name}: {ex.Message}";
+            }
+
+            Report("读选项透传到库里（Strict 应当抛异常）", strictThrew,
+                   strictThrew ? $"ShapefileException: {strictMessage}" : "没抛异常 —— shapefileOptions 是不是半路被丢了？");
+        }
+        else
+        {
+            Console.WriteLine("    - 没找到 10m 省级数据，跳过「读选项透传」这一项");
+        }
+
+        // ③④ 扩展名的大小写、以及“根本不认识”的情况，都在输出目录（bin 下）里造出来。
+        // 不放 Path.GetTempPath()：部分沙箱/受控环境不允许往系统临时目录写，bin 下一定可写、也一定被忽略。
+        var tempDir = Path.Combine(AppContext.BaseDirectory, ".selftest-temp-" + Path.GetFileNameWithoutExtension(Path.GetRandomFileName()));
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var upperPath = Path.Combine(tempDir, "upper.GEOJSON");
+            File.Copy(samplePath, upperPath, overwrite: true);
+            var upper = LayerReader.ReadFile(upperPath);
+            Report("大写扩展名 .GEOJSON 也认", upper.Features.Count == 5, $"{upper.Features.Count} 条对象");
+
+            var txtPath = Path.Combine(tempDir, "notes.txt");
+            File.WriteAllText(txtPath, "这里不是地图");
+            var threw = false;
+            var message = "";
+            try
+            {
+                LayerReader.ReadFile(txtPath);
+            }
+            catch (GeoJsonException ex)
+            {
+                threw = true;
+                message = ex.Message;
+            }
+
+            Report("不认识的扩展名 → 抛 GeoJsonException",
+                   threw && message.Contains(".shp", StringComparison.OrdinalIgnoreCase),
+                   threw ? $"「{message}」" : "没抛异常，而是继续往下读了");
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, recursive: true); } catch { /* 临时目录删不掉不影响结论 */ }
+        }
+
+        Console.WriteLine();
+        if (failures == 0)
+        {
+            Console.WriteLine("    结论：同一个入口按扩展名走对了路，文件名保真；大小写与不认识的类型也处理了。");
+            Console.WriteLine("      （剩下的是对话框本身：标题、过滤器、默认目录 —— 那部分只能手点。）");
+        }
+        else
+        {
+            Console.WriteLine($"    有 {failures} 项不符。按这个顺序查：");
+            Console.WriteLine("      ① 扩展名比较前有没有转小写（.SHP / .GeoJSON 都得认）；");
+            Console.WriteLine("      ② 分派的两边有没有接对：.shp → ShapefileReader，.geojson/.json → GeoJsonReader；");
+            Console.WriteLine("      ③ 不认识的扩展名要抛 GeoJsonException，并在消息里列出支持的类型；");
+            Console.WriteLine("      ④ 读不到记录 → shapefileOptions 是不是半路丢了。");
+        }
+
+        return failures;
+    }
+
+    /// <summary>
+    /// 找 TestData 目录（真实数据放在仓库根目录的 TestData 下，且不进版本库）。
+    /// 和 ResolveSamplePath 一样从输出目录往上找，这样"从哪个工作目录启动"都能找到。
+    /// </summary>
+    private static string? ResolveTestDataRoot()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null)
+        {
+            var candidate = Path.Combine(dir.FullName, "TestData");
+            if (Directory.Exists(candidate)) return candidate;
+            dir = dir.Parent;
+        }
+
+        return null;
     }
 
     private static string? ResolveSamplePath(string? given)

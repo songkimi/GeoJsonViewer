@@ -44,7 +44,30 @@ public sealed class GeoFeature
             _ => "(未命名的对象)",
         };
 
-    /// <summary>取一个属性；不存在（或为空字符串）时返回 null。</summary>
+    /// <summary>
+    /// 取一个属性；不存在（或只有空白）时返回 null。
+    ///
+    /// 先按原样查，查不到再忽略大小写查一次：GeoJSON 的键习惯小写（name、title），
+    /// 而 shapefile 的 .dbf 字段名习惯大写（NAME、ADMIN）——
+    /// 同一套界面代码要能同时认这两种，靠的就是这一行兜底。
+    /// </summary>
     public string? GetProperty(string key)
-        => Properties.TryGetValue(key, out var v) && !string.IsNullOrEmpty(v) && !string.IsNullOrWhiteSpace(v) ? v : null;
+    {
+        if (TryRead(key, out var direct)) return direct;
+
+        foreach (var pair in Properties)
+            if (string.Equals(pair.Key, key, StringComparison.OrdinalIgnoreCase) && TryRead(pair.Key, out var found))
+                return found;
+
+        return null;
+
+        bool TryRead(string name, out string? value)
+        {
+            value = null;
+            if (!Properties.TryGetValue(name, out var v)) return false;
+            if (string.IsNullOrWhiteSpace(v)) return false;
+            value = v;
+            return true;
+        }
+    }
 }

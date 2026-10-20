@@ -29,41 +29,60 @@ public sealed class SimpleRenderer
 
         foreach (var feature in layer.Features)
         {
-            // 先把这一条几何的所有点投影 + 映射成屏幕坐标。
-            // 投影和屏幕映射是两个独立步骤，这里不要合并成一个小函数，
-            // 否则以后排查"是投影错了还是映射错了"就得重新拆一遍。
-            var pts = new List<Point>(feature.Geometry.Points.Count);
-            foreach (var p in feature.Geometry.Points)
+            var geometry = feature.Geometry;
+
+            // 单部件：Points 就是全部。多部件：每个部件是独立的折线/面，逐个画。
+            // 千万别把多部件的点串成一条——那会画出跨部件的假边，图上多出数据里没有的线。
+            if (geometry.Parts.Count == 0)
             {
-                var (x, y) = Projection.Project(p, settings);
-                var (sx, sy) = bounds.ToScreen(x, y);
-                pts.Add(new Point(sx, sy));
+                if (DrawPart(geometry.Kind, geometry.Points, settings, bounds, target)) drawn++;
+                continue;
             }
 
-            if (pts.Count == 0) continue;
-
-            switch (feature.Geometry.Kind)
-            {
-                case GeometryKind.Point:
-                    target.Children.Add(CreatePointVisual(pts[0], bounds));
-                    drawn++;
-                    break;
-
-                case GeometryKind.LineString:
-                    if (pts.Count < 2) continue;                 // 少于两个点画不出线，跳过
-                    target.Children.Add(CreateLineVisual(pts, bounds));
-                    drawn++;
-                    break;
-
-                case GeometryKind.Polygon:
-                    if (pts.Count < 3) continue;                 // 少于三个点围不面积，跳过
-                    target.Children.Add(CreatePolygonVisual(pts, bounds));
-                    drawn++;
-                    break;
-            }
+            foreach (var part in geometry.Parts)
+                if (DrawPart(geometry.Kind, part, settings, bounds, target)) drawn++;
         }
 
         return drawn;
+    }
+
+    /// <summary>画一个部件；返回是否真的画出了图元（点数不够或类型不认识的返回 false）。</summary>
+    private static bool DrawPart(
+        GeometryKind kind, IReadOnlyList<GeoPoint> points,
+        ProjectionSettings settings, GeoBounds bounds, Canvas target)
+    {
+        // 先把这个部件的所有点投影 + 映射成屏幕坐标。
+        // 投影和屏幕映射是两个独立步骤，这里不要合并成一个小函数，
+        // 否则以后排查"是投影错了还是映射错了"就得重新拆一遍。
+        var pts = new List<Point>(points.Count);
+        foreach (var p in points)
+        {
+            var (x, y) = Projection.Project(p, settings);
+            var (sx, sy) = bounds.ToScreen(x, y);
+            pts.Add(new Point(sx, sy));
+        }
+
+        if (pts.Count == 0) return false;
+
+        switch (kind)
+        {
+            case GeometryKind.Point:
+                target.Children.Add(CreatePointVisual(pts[0], bounds));
+                return true;
+
+            case GeometryKind.LineString:
+                if (pts.Count < 2) return false;                 // 少于两个点画不出线，跳过
+                target.Children.Add(CreateLineVisual(pts, bounds));
+                return true;
+
+            case GeometryKind.Polygon:
+                if (pts.Count < 3) return false;                 // 少于三个点围不面积，跳过
+                target.Children.Add(CreatePolygonVisual(pts, bounds));
+                return true;
+
+            default:
+                return false;
+        }
     }
 
     // ─────────────────────────────── 图元构造 ───────────────────────────────

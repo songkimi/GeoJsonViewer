@@ -12,18 +12,25 @@
     <EnableDefaultApplicationDefinition>true</EnableDefaultApplicationDefinition>
   </PropertyGroup>
 
-  <!--
-    测试数据跟着程序一起复制到输出目录，"打开…"对话框的默认目录就是它。
-
-    为什么用 Content 而不是 None：
-      · Content 是"要跟程序一起发出去的文件"，天生带 CopyToOutputDirectory，
-        写少一点、意图也更准；
-      · None 是"纯粹放在那儿、不参与构建"的文件，让它拷贝是额外拧的开关。
-      两者这里都能跑，选 Content 是因为它描述的就是我们真正想表达的意思
-      （这些 .geojson 是程序运行时要读的数据，不是源码之外的杂物）。
-  -->
+  <!-- 示例数据随程序复制到输出目录，「打开…」对话框的默认目录就是它。
+       Content 自带 CopyToOutputDirectory，语义也比 None 更准（这些 .geojson 是运行时要读的数据）。 -->
   <ItemGroup>
     <Content Include="Samples\**\*.geojson" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- TestData 下的一次性探针工程自带 Program.cs 和 obj\ 生成文件，SDK 会把它们一起编进来，
+       导致两份 AssemblyInfo 冲突（CS0579 特性重复），所以整目录排除。 -->
+  <ItemGroup>
+    <Compile Remove="TestData\**\*.cs" />
+    <EmbeddedResource Remove="TestData\**\*" />
+    <None Remove="TestData\**\*" />
+  </ItemGroup>
+
+  <!-- shapefile 解析用 NetTopologySuite.IO.Esri.Shapefile：纯托管、MIT、读写都支持，不需要 GDAL 那样的本地二进制依赖。
+       版本锁到次版本号，避免浮动版本让同一份代码过段时间就编不过。 -->
+  <ItemGroup>
+    <PackageReference Include="NetTopologySuite.IO.Esri.Shapefile" Version="1.2.0" />
+    <PackageReference Include="ProjNET" Version="2.1.0" />
   </ItemGroup>
 
 </Project>
