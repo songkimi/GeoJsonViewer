@@ -5,7 +5,6 @@ using System.Windows.Controls;
 using System.Windows.Media;
 using GeoJsonViewer.Logic;
 using GeoJsonViewer.Models;
-using GeoJsonViewer.Rendering;
 
 /// <summary>
 /// 渲染器：把"一批部件"画进**一个** <see cref="DrawingVisual"/>（② 合并渲染）。
@@ -63,18 +62,6 @@ public static class IndexedRenderer
         GeoBounds bounds,
         Canvas target)
     {
-        // ★ 这里必须**按对象去重**，不能直接把 parts.Select(p => p.Feature) 喂下去。
-        //
-        //   原因（第 2 步实测过一次才发现）：索引的粒度是"部件"，一个对象可能有 N 个部件
-        //   （MultiPolygon 的海岛就是这样）。SimpleRenderer 的重载是按**对象**遍历它的全部部件，
-        //   所以同一个对象要是出现在列表里 N 次，它就会被完整地画 N 遍：
-        //     · 线：同一路径叠画 N 次，抗锯齿会变得更深、更粗；
-        //     · 面：填充是 0x55 半透明的，叠 N 次直接变成深色块；
-        //     · 点：叠画反而看不出差别，于是这个 bug 会**只在面数据上露头**。
-        //   去重之后，顺序沿用"首次出现"的顺序，和原来 foreach (layer.Features) 的顺序一致。
-        //
-        //   为什么用 ReferenceEquals 语义：GeoFeature 是 class，且没有重写 Equals，
-        //   默认就是引用相等——这里正需要它（同一个对象的多份部件必须认成同一个）。
         var features = new List<GeoFeature>();
         var seen = new HashSet<GeoFeature>();
 
@@ -92,14 +79,6 @@ public static class IndexedRenderer
 
     /// <summary>
     /// 粗版渲染（实验）：给"拖动中先画一张能看的"用。
-    ///
-    /// 两个可调项，就是两个开销来源：
-    ///   · <paramref name="tolerancePx"/>：抽稀容差（屏幕像素）。1 px 是常规档，4–8 px 肉眼是"边上毛一点"。
-    ///   · <paramref name="drawStrokes"/>：要不要描边。面 = 填充 + 描边两条图元，
-    ///     只填不描等于把图元数砍一半。
-    ///
-    /// ⚠️ 只给压测用（`_bench\coarse-check`）。产品路径不调用它 —— 粗版会掉细节，
-    /// 必须"随后补一张细的"，那是调度的事，不属于渲染器。
     /// </summary>
     public static int RenderCoarse(
         IEnumerable<GeoPartHit> parts,

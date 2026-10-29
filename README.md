@@ -3,8 +3,8 @@
 一个 Windows 桌面小程序（C# + WPF）：打开 `.geojson`、`.json` 或 `.shp`，把点、线、面画到画布上，
 支持滚轮缩放、左键拖拽平移、鼠标悬停查看属性。
 
-它是一个练手项目：存在的目的是把「基准转换 → 投影 → 屏幕映射」这条流水线亲手走通一遍。
-它不打算替代任何地图软件，也不追求性能。
+它是一个练手项目：存在的目的是把「基准转换 → 投影 → 屏幕映射」这条流水线亲手走通一遍，
+再把「几十万个图元怎么拖得动」这类工程问题一个个量过、改过。它不打算替代任何地图软件。
 
 ## 它长什么样
 
@@ -119,7 +119,7 @@ fit 与屏幕映射、缩放锚点、拉窗口、悬停命中、退化输入、�
 - 面**只画外环**：`Polygon` 里有洞（内环）时，洞会被一起填实；shapefile 的面同理。
 - 不处理 `GeometryCollection`。
 - shapefile 只读不写；坐标必须是经纬度，东偏 `y` 上带的「带号前缀」（如 `20500000`）不会自动剥。
-- 没有空间索引：渲染和命中测试都遍历全部对象，几万个点还行，百万级需要网格 / 四叉树。
+- 空间索引只在**打开文件 / 换投影 / 换基准**时整棵重建，不做增量更新；索引存的是一份部件外包矩形，几何改了就得重来。
 - 没有瓦片、没有网络、没有图层管理、没有属性编辑、没有导出。
 
 ## 代码结构
@@ -128,8 +128,17 @@ fit 与屏幕映射、缩放锚点、拉窗口、悬停命中、退化输入、�
 Logic/        读文件与算数：GeoJsonReader、ShapefileReader、LayerReader、PrjReader、PrjSuggestion、
               DatumCatalog、DatumTransform、GaussKruger、Projection、GeoBounds、HitTester
 Models/       GeoLayer、GeoFeature、GeoGeometry、GeoPoint
-Rendering/    SimpleRenderer（投影 + 屏幕映射）
-Views/        MainWindow.xaml(.cs)（工具栏、画布、状态栏、悬停）
+Rendering/    SpatialIndex.cs      IFeatureFinder：给定平面矩形，回答“这里有哪些部件”
+              LinearFinder.cs      参照实现：全部返回
+              StrtreeFinder.cs     真实现：按部件建 STRtree
+              ViewportCuller.cs    第二道漏斗：包围盒相交之后，再判几何是否真的碰到视野
+              IndexedRenderer.cs   渲染：清空 → 投影 → 合并到同一个 DrawingVisual
+              VisualHost.cs        只挂一个子 Visual 的 FrameworkElement（合并渲染的容器）
+              LodCache.cs          LOD
+              GeoPick.cs           查询返回项：部件 + 它所属的对象
+              SimpleRenderer.cs    旧的逐对象渲染，保留作对照
+Views/        MainWindow.xaml(.cs) 工具栏、画布、状态栏、悬停、拖动/缩放、帧调度、
+                                  “只平移不重画”与“拖动余量”
 Diagnostics/  SelfTest.cs（181 项自检）
 Samples/      示例数据
 ```

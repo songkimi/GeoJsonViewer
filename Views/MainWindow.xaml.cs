@@ -11,21 +11,6 @@ using GeoJsonViewer.Models;
 using GeoJsonViewer.Rendering;
 using Microsoft.Win32;
 
-// ★ 这个文件是**整份复制**自旧项目 GeoJsonViewer\Views\MainWindow.xaml.cs 的（本阶段唯一被复制的旧代码，
-//   理由见 PROJECT.md 第七节）。复制之后它就和旧项目那份分家了，差异只有下面这些，别的一字未改：
-//     ① 命名空间 GeoJsonViewer.Views → GeoJsonViewer.Views；
-//     ② 新增两个字段 `_finder`、`_redrawPending`；
-//     ③ 三条"图层变了"的路径（打开文件 / 换源基准 / 换投影）末尾各加一行 `_finder = new StrtreeFinder(_layer!, _settings)`；
-//        （第 2 步时这一行是 `new LinearFinder(_layer)`，第 4 步换成部件级 STRtree，窗口其余部分没动）
-//     ④ RebuildView() 改成"先查视野矩形 → 取候选 → 交给 IndexedRenderer"；
-//     ⑤ UpdateHoverTip() 改成"只在候选里判定"；
-//     ⑥ 所有原来直接调 RebuildView() 的地方（滚轮/拖动/尺寸变化）改成调 RequestRedraw()，
-//        由帧时钟统一画一次（第六节改动 2 的 ⑤）；
-//     ⑦ 文件末尾多了一组新方法：VisibleRect / QueryCandidates / AllParts / RequestRedraw / OnFrameTick。
-//   旧项目那份必须保持"已验证"状态，所以改动只发生在这个副本上。
-//
-//   为什么 ⑥ 和第 ③④⑤ 一起做而不是留到后面：它们都是"接线"，接完画面必须和旧程序逐像素一致，
-//   而这正是第八节第 2 步要验收的东西 —— 基准位要在这一版定下来。
 
 /// <summary>
 /// 主窗口：把 Models / Logic / Rendering 串起来，并处理鼠标键盘。
@@ -46,10 +31,6 @@ public partial class MainWindow : Window
 
     /// <summary>
     /// true = 正在**程序性地**改「源基准」下拉框，别把这次 SelectionChanged 当成用户操作。
-    ///
-    /// 下拉框的 SelectionChanged 分不清"用户点的"和"代码设的"。打开 shapefile 时我们要替用户选基准，
-    /// 若不放这个旗子，OnSourceDatumChanged 会插进 OnOpenClick 中间跑一次 ——
-    /// 那时 _layer 还是上一个文件的、_bounds 也还没按新文件重算，转出来是错的。
     /// </summary>
     private bool _suppressSourceDatumChanged;
 
@@ -61,9 +42,6 @@ public partial class MainWindow : Window
 
     /// <summary>
     /// "候选来源"：给定一块平面坐标矩形，回答"这里可能有哪些部件"。
-    ///
-    /// 为什么是这个类型而不是直接持有一个 STRtree：第 2 步接的是参照实现 LinearFinder（全部返回），
-    /// 第 4 步换成 StrtreeFinder 时**这个窗口只改了构造那一行** —— 换实现不改调用方，是接口唯一的意义。
     /// </summary>
     private IFeatureFinder? _finder;
     /// <summary>
@@ -110,13 +88,11 @@ public partial class MainWindow : Window
     private GeoLayer? _lastLayer;
     private ProjectionSettings _lastSettings;
     private bool _lastCulled;
-    /// <summary>上一帧是不是"只平移"（状态栏和探针要靠它说清楚"没重算"）。</summary>
     private bool _lastFrameTranslated;
 
     /// <summary>上一帧是不是"拖动中的粗版"（面只填色）。松手后必须补一帧细的。</summary>
     private bool _lastFrameCoarse;
 
-    /// <summary>粗版用的抽稀容差（屏幕像素）。实测 4 px 与 8 px 耗时一样，取小的。</summary>
     private const double CoarseTolerancePx = 4.0;
 
     /// <summary>松手后"空闲补细"的定时器（见 ScheduleFineUpgrade）。</summary>
@@ -146,10 +122,6 @@ public partial class MainWindow : Window
 
     /// <summary>
     /// 帧调度合并的"脏标记"：已经排上了一帧就不要再排。
-    ///
-    /// 老代码每个 MouseMove 都直接 RebuildView()，一帧要 1 秒多，事件只会越排越长
-    /// （探针量到的排队中位 1719 ms、最大 7375 ms）。这里改成"只标记、让帧时钟画一次"，
-    /// 丢的是**事件**，不是**位置** —— 位置始终记在 _dragStart 里，最后一帧一定是最新的。
     /// </summary>
     private bool _redrawPending;
 
@@ -172,26 +144,9 @@ public partial class MainWindow : Window
         InitializeComponent();
         _hoverTimer.Tick += OnHoverTimerTick;
 
-        // ① 图元复用：所有图元都挂在 _content 上，平移时只动它的 RenderTransform。
-        // MapCanvas 自己始终只有这一个子元素 —— 清空、裁剪、悬停提示都不受影响。
-        //
-        // ③ 位图缓存：**① 没有它就是个摆设**。实测（_bench\drag-check）：1× 全幅有 8,531 个
-        // Shape，只改变换不重画时，WPF 每帧仍要把整棵子树重新栅格化一遍 —— 一帧 2,528 ms，
-        // 比重新画（~800 ms）还慢。挂上 BitmapCache 之后，第一次画完就存成位图，
-        // 平移变成"搬一张图"，实测落到 ~10 ms 量级。
-        // 缩放/换数据时缓存会自动失效（内容变了），所以正确性不受影响。
-        // 位图缓存按屏幕 DPI 光栅化：1.0 的缓存放到 1.5× 屏幕上会被放大 1.5 倍，边缘糊成一片。
         _bitmapCache = new BitmapCache(VisualTreeHelper.GetDpi(this).DpiScaleX);
         if (Environment.GetEnvironmentVariable("GJV2_NOCACHE") != "1") _content.CacheMode = _bitmapCache;
 
-        // ④ 命中测试不参与：**"地图里拖卡、地图外拖滑"就是这个**。实测（_bench\hittest-check）：
-        // 指针落在图形上时，WPF 为路由一条 MouseMove 要先做输入命中测试，要逐个测那 8,531 个
-        // Shape、还要算几何包含（俄罗斯、南极洲那种几万点的多边形）——中位 28 ms/次，
-        // P90 687 ms/次；落在空白处只测 Canvas 背景，0.002 ms。差 4 个数量级。
-        //
-        // 我们从来不需要 WPF 帮忙命中：点击/拖动都挂在 MapCanvas 上，而"点到哪个对象"由
-        // HitTester + 空间索引自己算（那是第 6 步的活）。所以关掉内容的命中测试，
-        // 让 WPF 只测到 MapCanvas 这一层就够了。
         _content.IsHitTestVisible = false;
         MapCanvas.Children.Add(_content);
 
@@ -220,17 +175,11 @@ public partial class MainWindow : Window
 
     /// <summary>
     /// 打开一个文件的完整流程（对话框之外的全部动作）。
-    ///
-    /// 单独抽出来的原因是 `--bench`：压测必须走**和用户点"打开"完全一样**这条路径，
-    /// 否则压的不是这个程序。复制一份给 Bench 用就等于养了两条会各自发散的路径 ——
-    /// 这是第 2 步以来一直在躲的坑，这里也不破例。
     /// </summary>
     private void OpenFile(string filePath)
     {
         try
         {
-            // 读出来的这一份是「原始图层」：基准转换永远从它出发（理由见 RebuildTransformedLayer）。
-            // 后缀分派在 Logic/LayerReader 里，窗口不再关心“这是 geojson 还是 shp”。
             _rawLayer = LayerReader.ReadFile(filePath);
             // 顺序要紧：.prj 说明的是"文件里的坐标是哪套基准"，所以必须先选定源基准，再转换。
             ApplyPrjSuggestion(filePath);
@@ -290,9 +239,6 @@ public partial class MainWindow : Window
         return Directory.Exists(samples) ? samples : AppContext.BaseDirectory;
     }
 
-    // ─────────────────────────── 压测挂钩（--bench 专用）───────────────────────────
-    // 只把已有的私有实现转发出去，一行行为都不改：目的是让 Diagnostics\Bench 量的
-    // 是"真程序这条路径"，而不是在测试里另写一条会慢慢发散的复制品。
 
     internal void BenchOpen(string path) => OpenFile(path);
 
@@ -306,8 +252,6 @@ public partial class MainWindow : Window
         RebuildView();
     }
 
-    // 给 _bench\drag-check 用：真鼠标的"按下/松开"会走这两个分支，
-    // 而拖动余量（DragMarginPx）只在 _dragging 为真时生效，所以压测必须能开关它。
     internal void BenchBeginDrag()
     {
         _dragging = true;
@@ -316,8 +260,6 @@ public partial class MainWindow : Window
 
     internal void BenchEndDrag()
     {
-        // 走真实的收尾路径（而不是 BenchRebuild 那种强制全量）：粗版 → 空闲补细 的那条链路
-        // 只有真 EndDrag 才会走到，压测必须验它。
         EndDrag();
     }
 
@@ -339,14 +281,9 @@ public partial class MainWindow : Window
 
     /// <summary>
     /// 全量重画的次数（只给探针看）。
-    ///
-    /// 探针原来靠"画布子元素数量/内容包围盒变没变"猜有没有重建。① 之后画布上只有 1 个子元素
-    /// （`_content`），这个判据彻底失效——日志里出现"0 帧重建"却又卡，就是它把真重建漏掉了。
-    /// 计数器是唯一不会骗人的口径：重画一次加一，平移不动它。
     /// </summary>
     internal int BenchRebuildCount { get; private set; }
 
-    /// <summary>画过的帧数（平移帧和重画帧都算），只给体检工具/探针用。</summary>
     internal int BenchFrameCount { get; private set; }
 
     internal (GeoLayer? Layer, ProjectionSettings Settings, GeoBounds? Bounds) BenchState
@@ -354,8 +291,6 @@ public partial class MainWindow : Window
 
     /// <summary>
     /// 打开 .shp 时读旁边的 .prj：能认出来就把「源基准」替用户选好，认不出/是投影/没有声明就只留一句话。
-    ///
-    /// 只有 .shp 才有 .prj（GeoJSON 的坐标系写在标准里，永远是 WGS84 经纬度）。
     /// </summary>
     private void ApplyPrjSuggestion(string filePath)
     {
@@ -384,18 +319,6 @@ public partial class MainWindow : Window
 
     /// <summary>
     /// 按工具栏「源基准」把 _rawLayer 转换到 CGCS2000，返回**显示用**的那个图层。
-    ///
-    /// 为什么输入必须是 _rawLayer、而不是 _layer：
-    ///   TransformLayer 是纯函数，但它**不幂等** —— 在已经转换过的图层上再按同一个源基准转一次，
-    ///   等于把偏移量又叠加一遍（北京54 → CGCS2000 在北京那种位置一次约 198 米，转两次就快 400 米）。
-    ///   自检 [13] 里有一条专门量这件事。"来回切下拉框能不能回到原样"全看这一条。
-    ///
-    /// 为什么目标固定是 CGCS2000：
-    ///   本项目的投影（高斯 / 墨卡托）都按 CGCS2000 算。源基准只说明"文件里的坐标是哪套基准"，
-    ///   统一到 CGCS2000 之后，投影、fit、命中测试就都能用同一套数字。
-    ///
-    /// 下拉框的项顺序和 DatumCatalog.All 一一对应（0=CGCS2000, 1=WGS84, 2=北京54, 3=西安80）；
-    /// 大地高本项目一律按 0（"所有点都贴在地面上"这个前提写在 TransformLayer 的签名上）。
     /// </summary>
     private GeoLayer? RebuildTransformedLayer()
     {
@@ -434,9 +357,6 @@ public partial class MainWindow : Window
         // 这不是"理论上可能"，是每次启动都会发生的事 —— 少了这一句就是启动即崩。
         if (EllipsoidBox is null || ZoneWidthBox is null) return;
 
-        // 现在是两项时的写法。加了第三项「高斯-克吕格」以后，这里要改成按三个下拉框建设置：
-        //   高斯模式读椭球下拉 + 带宽下拉，中央经线则是拿数据的经度范围中点自动选出来的。
-        // 下拉框的项顺序和枚举顺序一一对应：0=Linear, 1=WebMercator, 2=GaussKruger
         _settings = Projection.BuildSettings(ProjectionBox.SelectedIndex, EllipsoidBox.SelectedIndex, ZoneWidthBox.SelectedIndex, _layer?.LonLatBounds ?? new GeoRect());
 
 
@@ -599,16 +519,6 @@ public partial class MainWindow : Window
     {
         if (_layer is null || _bounds is null || !_bounds.HasViewport) return;
 
-        // 只在**候选**里判定（第 2 步候选是全部；第 4 步起是真的变少了，第 6 步验收的就是这条路径）。
-        //
-        // ★ 这里选的是"包一个临时 GeoLayer"，而不是给 HitTester 加重载。理由：
-        //   · HitTest 只用到 layer.Features（它不读 FileName / LonLatBounds / AllPoints），
-        //     包一层是零成本的适配，不动旧代码；
-        //   · 而 SimpleRenderer 那边**必须**加重载：它的入参是 Canvas 和一大堆画图逻辑，
-        //     复制那份逻辑就等于让"线宽/颜色"出现两份真相。两处的取舍不同，是因为
-        //     几何判定的接口（Features + settings + bounds + 坐标）本来就只依赖 Features。
-        //   · 去重：候选是按部件给的，同一个对象可能来好几份；HitTest 按对象遍历，
-        //     重复喂进去会让"同一个对象被判定多次"，虽然结果一样，但白算。
         var features = new List<GeoFeature>();
         var seen = new HashSet<GeoFeature>();
         foreach (var candidate in QueryAround(pos))
@@ -623,8 +533,6 @@ public partial class MainWindow : Window
             return;
         }
 
-        // KeyValuePair 的 ToString() 长得像 [name, 北京]，直接 Join 出来是给调试看的，不是给人看的。
-        // 挑前 3 个属性拼成「name: 北京」这种一行一个的样式。
         var lines = hit.Properties.Take(3).Select(kv => $"{kv.Key}: {kv.Value}");
         HoverText.Text = hit.DisplayName + "\n" + string.Join("\n", lines);
 
@@ -744,15 +652,6 @@ public partial class MainWindow : Window
         _content.RenderTransform = Transform.Identity;
         _content.Children.Clear();
 
-        // 拖动时多画一圈余量：_content 撑大 2×余量、左上角钉到 (-margin, -margin)，
-        // 画完再整体挪 (margin, margin) —— 这样"画进 enlarged canvas 的坐标"与"屏幕坐标"一致，
-        // 平移时在这个基准上继续加 dx/dy。
-        //
-        // ★ 这两个 SetLeft/SetTop 不能省：只把 Width/Height 撑大、不把原点挪到负方向，
-        //   内容会整体偏右下 margin 像素（2026-10-26 用户报的"拖完松手图跟坐标对不上"就是这个）。
-        // ★ 余量只看 _dragging，不看 _lastCulled（2026-10-26 修正）：一旦余量铺到一屏，
-        //   1.5× 那一档会把 8,531 个部件全都装进来 → _lastCulled 变 false → 下一帧按"没裁剪"
-        //   给了 0 余量，可平移判据走的却是"有余量"那条分支，于是能拖到画过的边界以外、露出空白。
         var marginX = _dragging ? MapCanvas.ActualWidth : 0;
         var marginY = _dragging ? MapCanvas.ActualHeight : 0;
         _content.Width = MapCanvas.ActualWidth + 2 * marginX;
@@ -765,29 +664,11 @@ public partial class MainWindow : Window
         _lastBreakdownClear = (System.Diagnostics.Stopwatch.GetTimestamp() - tClear) * 1000.0
             / System.Diagnostics.Stopwatch.Frequency;
 
-        // 接线：先问 _finder（第 2 步是 LinearFinder 全部返回，第 4 步起是 StrtreeFinder 只给视野内的），
-        // 再交给 IndexedRenderer。先在"全返回"下证明"取候选 → 画候选"和"直接画全部"是同一张图，
-        // 再让候选真的变少 —— 顺序反了，画面少一块时分不清是谁的错。
-        //
-        // ★ 渲染和悬停走同一条 QueryCandidates()：外扩、闸门、裁剪这三件事只允许有一个出处。
-        //   第 5 步验收时踩过的坑就是这里 —— RebuildView 自己调 _finder.Query(原始矩形)，
-        //   而悬停走的是 QueryCandidates()，于是"外扩 26 px"只给悬停用上了，画面在 4×/8×/20×
-        //   会把压边的对象整块丢掉（肉眼看是边缘缺一条线，step2-check 的差异只有 21/255）。
         var tQuery = System.Diagnostics.Stopwatch.GetTimestamp();
         var parts = QueryCandidates(marginX, marginY);
         _lastCandidates = parts.Count;
         var tDraw = System.Diagnostics.Stopwatch.GetTimestamp();
 
-        // 合并渲染（②）：画布上只留 1 个 VisualHost，图元全画进一张 DrawingVisual。
-        // GJV2_NOMERGE=1 时走老路（每个部件一个 Shape），只给验收工具做 A/B 对照。
-        // 拖动中的帧画**粗版**：面只填色、不描边。实测（`_bench\coarse-check`，ne_10m 1.5×）
-        // 细版 1,014 ms（建几何 113 + 光栅 900）→ 粗版 217 ms（98 + 119）。
-        // 省下来的几乎全是"8,531 条抗锯齿描边"的光栅化 —— 抽稀顶点反而没用（4 px 与 8 px 一样）。
-        // 松手时 EndDrag() → RequestRedraw() 补一帧细的（CanTranslateOnly 里会为它让路）。
-        // 粗版有两种场合：
-        //   · 拖动中 —— 帧要便宜（6 ms）；
-        //   · 滚轮缩放 —— 缩放必须重算全部顶点的屏幕坐标，细版 1.4 s，先给一帧粗的（~0.2 s）。
-        // 两者都靠 _fineTimer 在空闲 250 ms 后补一帧细的（见 OnFineTimerTick）。
         var coarse = _dragging || _coarsePending;
         _lastFrameCoarse = coarse;
 
@@ -873,30 +754,10 @@ public partial class MainWindow : Window
             && Math.Abs(_bounds.PanY - _drawPanY) <= _drawnMarginY - MaxPointRadiusPx;
     }
 
-    // ────────────────────────── 候选来源 / 帧调度（第 2 步新增）──────────────────────────
+    // ────────────────────────── 候选来源 / 帧调度 ──────────────────────────
 
     /// <summary>
     /// 当前视野对应的**平面坐标**矩形（投影之后那套，不是经纬度）。
-    ///
-    /// 为什么取屏幕的两个角再反解就行、不用取四个角：
-    ///   ToScreen 是**仿射映射**（只含缩放、平移、y 轴翻转，没有旋转和倾斜），
-    ///   所以一个轴对齐的矩形映回去仍然是轴对齐的矩形 —— 两个对角点就定死了它。
-    ///   ★ 这句论断是整份文档里最该被验证的一条。验证方法见第八节第 3 步。
-    ///
-    /// ✅ 已验算（第八节第 3 步，工具 `_bench\step3-rect`，3 种投影 × 4 档缩放共 12 组全过）：
-    ///   ① ToScreen(MinX, MaxY) = (0,0)、ToScreen(MaxX, MinY) = (W,H)，误差 &lt; 1e-6 像素；
-    ///   ② 四个角都反解一遍，x 只取 {MinX, MaxX}、y 只取 {MinY, MaxY} —— 12 组全是 2/2；
-    ///   ③ 撒 65×65 个屏幕点，用 o + sx·u + sy·v 预测反解值，残差 1e-14 ~ 2e-12（双精度尾差，判据 1e-9）；
-    ///   ④ 框外 0.1% 的点全部落在屏幕外 —— 方向没翻。
-    ///   线性投影 1×、视口 1105.33×673.92 的手工样本：
-    ///     VisibleRect = (63.27562654486683, 2.721058824906045, 150.7487373234024, 56.05301350418959)
-    ///     ToData(0,0) = (63.2756, 56.0530) ← 左上是 (MinX, MaxY)，ToData(W,H) = (150.7487, 2.7211) ← 右下是 (MaxX, MinY)
-    ///
-    /// ⚠️ 这个矩形是**没有留白**的视野。点半径最大 26 px、线宽最大 6 px，
-    ///    "包围盒刚好在视野外一点点"的对象，它的点/线仍有一半压在画面里。
-    ///    所以真正去查询之前还得**外扩一圈**（按 26 px 换算成平面单位）——
-    ///    那是第 5 步的事。现在（第 4 步）StrtreeFinder 查的就是这个矩形，所以压边的对象
-    ///    在补上外扩之前会被**少给** —— 第 5 步就是来补这一圈的。
     /// </summary>
     private static (double MinX, double MinY, double MaxX, double MaxY) VisibleRect(GeoBounds bounds)
     {
@@ -907,14 +768,6 @@ public partial class MainWindow : Window
 
     /// <summary>
     /// 只查光标周围一小块的候选（悬停专用）。
-    ///
-    /// 为什么不能继续用 `QueryCandidates()`：那个框是**整个视野**。1× 全幅时视野里就是全部
-    /// 8,531 个部件，每 40 ms 的悬停节拍都要把它们全投影一遍做命中测试——实测 310 ms 一次，
-    /// 鼠标一动就是幻灯片（探针日志里表现为"排队"上千毫秒，而 UI 线程列看不出耗时，
-    /// 因为钱花在 DispatcherTimer 的回调里，账单记在下一个事件头上）。
-    ///
-    /// 框的大小：容差 8 px（`HitTester` 默认）+ 点半径上限 26 px；线宽 6 px 更小，被这两个覆盖。
-    /// 判据仍是"宁多给、不少给"：多给只是白算，少给会漏判。
     /// </summary>
     private IReadOnlyList<GeoPartHit> QueryAround(Point pos)
     {
@@ -944,18 +797,12 @@ public partial class MainWindow : Window
             VisibleRect(_bounds), _bounds, MaxPointRadiusPx + marginX, MaxPointRadiusPx + marginY);
         var candidates = _finder.Query(minX, minY, maxX, maxY);
 
-        // 闸门：候选占全库 1/20 以下才去 Cull —— 1× 全图这一档实测 202 ms 一个都删不掉，
-        // 中缩放档也要 11 ms，而 Cull 的固定成本（约 25 µs/部件）比它能删掉的东西还贵。
-        //
-        // GJ_GATE 是给 _bench 做 A/B 用的（`set GJ_GATE=15` 再跑探针），不设就是 20。
-        // 它只影响"要不要多花那 10 ms 去筛"，不影响对错：筛与不筛都是超集。
         if (candidates.Count * GateFactor <= _lastTotalParts)
             return ViewportCuller.Cull(candidates, _settings, minX, minY, maxX, maxY);
 
         return candidates;
     }
 
-    /// <summary>闸门的分母系数（默认 20，可用环境变量 GJ_GATE 覆盖，仅供压测对比）。</summary>
     private static readonly int GateFactor =
         int.TryParse(Environment.GetEnvironmentVariable("GJ_GATE"), out var gate) && gate > 0 ? gate : 20;
 
@@ -1083,9 +930,6 @@ public partial class MainWindow : Window
             var neighbourCm = double.NaN;
             if (_settings.Mode == ProjectionMode.GaussKruger)
             {
-                // 高斯模式的平面数值单位是米，要反算才能得到经纬度。
-                // GaussKruger.Inverse 收的是测绘坐标 (x 北, y 东)，而这里的 x 是「水平」、y 是「垂直」，
-                // 也就是这里的 (x, y) 恰好是 (东, 北)，所以两个实参要调过来。
                 var p = GaussKruger.Inverse(y, x, _settings.Ellipsoid, _settings.CentralMeridianDegrees);
                 (lon, lat) = (p.Lon, p.Lat);
                 neighbourCm = _settings.CentralMeridianDegrees + _settings.ZoneWidthDegrees;
