@@ -24,10 +24,28 @@ public sealed class SimpleRenderer
 {
     /// <summary>渲染。返回画出来的图元数量（用于状态栏）。</summary>
     public int Render(GeoLayer layer, ProjectionSettings settings, GeoBounds bounds, Canvas target)
+        => Render(layer.Features, settings, bounds, target);
+
+    /// <summary>
+    /// 渲染**任意一批**对象。返回画出来的图元数量。
+    ///
+    /// 为什么加这个重载：空间索引查出来的是"一批部件"，不是一整个图层。
+    /// 为什么把它放在这个类里、而不是在 GeoJsonViewer2 里另写一个渲染器：
+    ///   画图的行为只允许有一份真相。复制一份到新工程，以后改颜色/线宽就得改两处，
+    ///   改一处漏一处的症状是"新窗口和旧窗口画得不一样"，而且没人说得清哪份是对的。
+    ///
+    /// 行为上它和上面那个重载**完全等价**：上面那个就是把 layer.Features 转给它。
+    /// `--selftest` 里凡是走 Render(layer, …) 的地方，路径和结果都没变。
+    /// </summary>
+    public int Render(
+        IEnumerable<GeoFeature> features,
+        ProjectionSettings settings,
+        GeoBounds bounds,
+        Canvas target)
     {
         var drawn = 0;
 
-        foreach (var feature in layer.Features)
+        foreach (var feature in features)
         {
             var geometry = feature.Geometry;
 

@@ -39,3 +39,6 @@ desktop.ini
 # ── 真实数据与一次性探针工程：体积大 / 许可不定，不进版本库 ─
 # 若将来要提交其中某个样例，用 !TestData/路径 开例外。
 TestData/
+
+# ── 第二阶段的测量工程（GeoJsonViewer2\_bench：探针 / 各类 check / spike），不上传 ──
+_bench/

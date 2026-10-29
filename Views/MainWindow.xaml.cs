@@ -2,12 +2,30 @@ namespace GeoJsonViewer.Views;
 
 using System.IO;
 using System.Windows;
+using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
 using GeoJsonViewer.Logic;
 using GeoJsonViewer.Models;
+using GeoJsonViewer.Rendering;
 using Microsoft.Win32;
+
+// ★ 这个文件是**整份复制**自旧项目 GeoJsonViewer\Views\MainWindow.xaml.cs 的（本阶段唯一被复制的旧代码，
+//   理由见 PROJECT.md 第七节）。复制之后它就和旧项目那份分家了，差异只有下面这些，别的一字未改：
+//     ① 命名空间 GeoJsonViewer.Views → GeoJsonViewer.Views；
+//     ② 新增两个字段 `_finder`、`_redrawPending`；
+//     ③ 三条"图层变了"的路径（打开文件 / 换源基准 / 换投影）末尾各加一行 `_finder = new StrtreeFinder(_layer!, _settings)`；
+//        （第 2 步时这一行是 `new LinearFinder(_layer)`，第 4 步换成部件级 STRtree，窗口其余部分没动）
+//     ④ RebuildView() 改成"先查视野矩形 → 取候选 → 交给 IndexedRenderer"；
+//     ⑤ UpdateHoverTip() 改成"只在候选里判定"；
+//     ⑥ 所有原来直接调 RebuildView() 的地方（滚轮/拖动/尺寸变化）改成调 RequestRedraw()，
+//        由帧时钟统一画一次（第六节改动 2 的 ⑤）；
+//     ⑦ 文件末尾多了一组新方法：VisibleRect / QueryCandidates / AllParts / RequestRedraw / OnFrameTick。
+//   旧项目那份必须保持"已验证"状态，所以改动只发生在这个副本上。
+//
+//   为什么 ⑥ 和第 ③④⑤ 一起做而不是留到后面：它们都是"接线"，接完画面必须和旧程序逐像素一致，
+//   而这正是第八节第 2 步要验收的东西 —— 基准位要在这一版定下来。
 
 /// <summary>
 /// 主窗口：把 Models / Logic / Rendering 串起来，并处理鼠标键盘。
@@ -41,6 +59,100 @@ public partial class MainWindow : Window
     private GeoBounds? _bounds;
     private ProjectionSettings _settings = ProjectionSettings.Linear;
 
+    /// <summary>
+    /// "候选来源"：给定一块平面坐标矩形，回答"这里可能有哪些部件"。
+    ///
+    /// 为什么是这个类型而不是直接持有一个 STRtree：第 2 步接的是参照实现 LinearFinder（全部返回），
+    /// 第 4 步换成 StrtreeFinder 时**这个窗口只改了构造那一行** —— 换实现不改调用方，是接口唯一的意义。
+    /// </summary>
+    private IFeatureFinder? _finder;
+    /// <summary>
+    /// 候选组件的数量
+    /// </summary>
+    private int _lastCandidates;
+
+    /// <summary>上一帧拆开之后的两段耗时（毫秒），只被 --bench 读取。</summary>
+    private double _lastBreakdownClear;
+    private double _lastBreakdownQuery;
+    private double _lastBreakdownDraw;
+
+    /// <summary>
+    /// 这一层一共有多少个**部件**（状态栏的分母）。
+    ///
+    /// 为什么不用 `Features.Count`：对象数和部件数不是一回事。ne_10m 是 4,595 个对象 /
+    /// 8,531 个部件，分子是部件、分母却写对象数时，整幅视野会显示成 `4595/4595` ——
+    /// 看起来像索引没干活，其实是两个数在报不同的东西。
+    /// </summary>
+    private int _lastTotalParts;
+
+    // ─────────────────── ① 图元复用：只平移时不动顶点 ───────────────────
+    //
+    // 老路子每帧 `Children.Clear()` + 重造 8,531 个 UIElement：ne_10m 一帧 854 ms，
+    // 其中清空就占 462 ms。可平移的时候，顶点本来就是对的（ToScreen 只是多了个 pan），
+    // 真正该变的只有"整张纸往哪挪"——所以给一个容器加 TranslateTransform，一个顶点都不碰。
+    //
+    // 能这么干的前提：**上一帧画的是全部部件**（_lastCulled == false）。
+    // 8× 下画的是裁剪后的几十个，这时候平移会把"没画的对象"带进画面，必须重算。
+    private readonly Canvas _content = new();
+
+    /// <summary>③ 位图缓存：只有"下一帧可能只平移"时才挂（见 RebuildView 末尾）。</summary>
+    private BitmapCache? _bitmapCache;
+
+    /// <summary>最后一次**真正画图**时的 pan。平移帧的位移一律相对它算，避免误差逐帧累积。</summary>
+    private double _drawPanX;
+    private double _drawPanY;
+    private bool _hasFrame;
+    private double _lastPanX;
+    private double _lastPanY;
+    private double _lastZoom = double.NaN;
+    private double _lastViewW;
+    private double _lastViewH;
+    private GeoLayer? _lastLayer;
+    private ProjectionSettings _lastSettings;
+    private bool _lastCulled;
+    /// <summary>上一帧是不是"只平移"（状态栏和探针要靠它说清楚"没重算"）。</summary>
+    private bool _lastFrameTranslated;
+
+    /// <summary>上一帧是不是"拖动中的粗版"（面只填色）。松手后必须补一帧细的。</summary>
+    private bool _lastFrameCoarse;
+
+    /// <summary>粗版用的抽稀容差（屏幕像素）。实测 4 px 与 8 px 耗时一样，取小的。</summary>
+    private const double CoarseTolerancePx = 4.0;
+
+    /// <summary>松手后"空闲补细"的定时器（见 ScheduleFineUpgrade）。</summary>
+    private DispatcherTimer? _fineTimer;
+
+    /// <summary>下一次重画是不是"先给粗的"（滚轮缩放时置位，细版落地时清掉）。</summary>
+    private bool _coarsePending;
+
+    // ── 拖动余量（2026-10-26）────────────────────────────────────────────────
+    //
+    // 1× 全幅时整层都在视野里，平移只要动一下 RenderTransform（①）。可一旦放大，
+    // 裁剪后的内容只覆盖视口，"往边上推"就会推出白边。做法是**多画一圈余量**：
+    // 拖动的那几帧按"视口 + DragMarginPx"去查候选、给 _content 撑大同样的尺寸，
+    // 于是平移在 ±余量之内都有东西可看；超出余量时才真正重画一次。
+    //
+    // 余量的取舍（2026-10-26 定）：它只花两样东西 —— 一次性的重画时间 与 位图缓存的内存。
+    // 时间这边几乎不涨（1.5× 时 6,700 个部件已经在视野里，再要大一圈只多几百个）；
+    // 涨的是内存，所以余量按**一屏**取：内容 = 3 屏 × 3 屏。
+    //
+    // 为什么是"一屏"：鼠标不可能拖出屏幕，所以**一次**拖动最多移动一屏。
+    // 也就是说铺一屏余量，一次拖动里永远不用重画；要重画只会发生在"松开、再按下、
+    // 继续拖"跨过一次屏宽之后。铺得比一屏再大，收益是 0（拖不到那么远）。
+
+    /// <summary>上一帧画图时用的余量（平移距离从它算起）。x/y 分开，按视口尺寸取。</summary>
+    private double _drawnMarginX;
+    private double _drawnMarginY;
+
+    /// <summary>
+    /// 帧调度合并的"脏标记"：已经排上了一帧就不要再排。
+    ///
+    /// 老代码每个 MouseMove 都直接 RebuildView()，一帧要 1 秒多，事件只会越排越长
+    /// （探针量到的排队中位 1719 ms、最大 7375 ms）。这里改成"只标记、让帧时钟画一次"，
+    /// 丢的是**事件**，不是**位置** —— 位置始终记在 _dragStart 里，最后一帧一定是最新的。
+    /// </summary>
+    private bool _redrawPending;
+
     private Point _dragStart;          // 上一次鼠标位置（按下时定起点，移动时不断刷新）
     private bool _dragging;
 
@@ -59,6 +171,29 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         _hoverTimer.Tick += OnHoverTimerTick;
+
+        // ① 图元复用：所有图元都挂在 _content 上，平移时只动它的 RenderTransform。
+        // MapCanvas 自己始终只有这一个子元素 —— 清空、裁剪、悬停提示都不受影响。
+        //
+        // ③ 位图缓存：**① 没有它就是个摆设**。实测（_bench\drag-check）：1× 全幅有 8,531 个
+        // Shape，只改变换不重画时，WPF 每帧仍要把整棵子树重新栅格化一遍 —— 一帧 2,528 ms，
+        // 比重新画（~800 ms）还慢。挂上 BitmapCache 之后，第一次画完就存成位图，
+        // 平移变成"搬一张图"，实测落到 ~10 ms 量级。
+        // 缩放/换数据时缓存会自动失效（内容变了），所以正确性不受影响。
+        // 位图缓存按屏幕 DPI 光栅化：1.0 的缓存放到 1.5× 屏幕上会被放大 1.5 倍，边缘糊成一片。
+        _bitmapCache = new BitmapCache(VisualTreeHelper.GetDpi(this).DpiScaleX);
+        if (Environment.GetEnvironmentVariable("GJV2_NOCACHE") != "1") _content.CacheMode = _bitmapCache;
+
+        // ④ 命中测试不参与：**"地图里拖卡、地图外拖滑"就是这个**。实测（_bench\hittest-check）：
+        // 指针落在图形上时，WPF 为路由一条 MouseMove 要先做输入命中测试，要逐个测那 8,531 个
+        // Shape、还要算几何包含（俄罗斯、南极洲那种几万点的多边形）——中位 28 ms/次，
+        // P90 687 ms/次；落在空白处只测 Canvas 背景，0.002 ms。差 4 个数量级。
+        //
+        // 我们从来不需要 WPF 帮忙命中：点击/拖动都挂在 MapCanvas 上，而"点到哪个对象"由
+        // HitTester + 空间索引自己算（那是第 6 步的活）。所以关掉内容的命中测试，
+        // 让 WPF 只测到 MapCanvas 这一层就够了。
+        _content.IsHitTestVisible = false;
+        MapCanvas.Children.Add(_content);
 
         // 定时器一开机就转起来：它是"空转"的（每 40ms 看一眼鼠标在哪，没东西就立刻返回），
         // 代价可以忽略，但省掉了"什么时候该 Start"这种容易漏掉的时序问题。
@@ -80,13 +215,25 @@ public partial class MainWindow : Window
 
         if (dialog.ShowDialog(this) != true) return;
 
+        OpenFile(dialog.FileName);
+    }
+
+    /// <summary>
+    /// 打开一个文件的完整流程（对话框之外的全部动作）。
+    ///
+    /// 单独抽出来的原因是 `--bench`：压测必须走**和用户点"打开"完全一样**这条路径，
+    /// 否则压的不是这个程序。复制一份给 Bench 用就等于养了两条会各自发散的路径 ——
+    /// 这是第 2 步以来一直在躲的坑，这里也不破例。
+    /// </summary>
+    private void OpenFile(string filePath)
+    {
         try
         {
             // 读出来的这一份是「原始图层」：基准转换永远从它出发（理由见 RebuildTransformedLayer）。
             // 后缀分派在 Logic/LayerReader 里，窗口不再关心“这是 geojson 还是 shp”。
-            _rawLayer = LayerReader.ReadFile(dialog.FileName);
+            _rawLayer = LayerReader.ReadFile(filePath);
             // 顺序要紧：.prj 说明的是"文件里的坐标是哪套基准"，所以必须先选定源基准，再转换。
-            ApplyPrjSuggestion(dialog.FileName);
+            ApplyPrjSuggestion(filePath);
             _layer = RebuildTransformedLayer();
         }
         catch (GeoJsonException ex)
@@ -96,7 +243,9 @@ public partial class MainWindow : Window
             _rawLayer = null;
             _bounds = null;
             _prjWarning = null;
-            MapCanvas.Children.Clear();
+            _hasFrame = false;
+            _content.Children.Clear();
+            _content.RenderTransform = Transform.Identity;
             HoverTip.Visibility = Visibility.Collapsed;
             ShowMessage(ex.Message);
             StatusText.Text = "打开失败";
@@ -125,8 +274,13 @@ public partial class MainWindow : Window
         // 不用另外调 SetViewport：Reset 的入参就是画布尺寸，它会一并记下并重算 BaseScale。
         _bounds = new GeoBounds(ProjectAllPoints());
         _bounds.Reset(MapCanvas.ActualWidth, MapCanvas.ActualHeight);
-        
-        RebuildView();
+
+        // 图层换了 = 候选来源也要换。这一行必须和 _layer 在同一段代码里更新：
+        // 少了它，画面会拿着**上一个文件**的对象去画（打开第二个文件时特别明显：一片空白或形状对不上）。
+        _finder = new StrtreeFinder(_layer!, _settings);
+        _lastTotalParts = CountParts(_layer!);
+
+        RequestRedraw();
     }
 
     /// <summary>文件对话框默认目录：优先 Samples（测试数据就在那儿），否则用程序所在目录。</summary>
@@ -135,6 +289,68 @@ public partial class MainWindow : Window
         var samples = Path.Combine(AppContext.BaseDirectory, "Samples");
         return Directory.Exists(samples) ? samples : AppContext.BaseDirectory;
     }
+
+    // ─────────────────────────── 压测挂钩（--bench 专用）───────────────────────────
+    // 只把已有的私有实现转发出去，一行行为都不改：目的是让 Diagnostics\Bench 量的
+    // 是"真程序这条路径"，而不是在测试里另写一条会慢慢发散的复制品。
+
+    internal void BenchOpen(string path) => OpenFile(path);
+
+    /// <summary>
+    /// --bench 用的"强制全量重画"：清掉"上一帧可复用"的标记，量到的永远是重算的那条路。
+    /// 否则第二次调用会被 ① 优化成"只平移 0 像素"，量出 0 ms 看着像奇迹。
+    /// </summary>
+    internal void BenchRebuild()
+    {
+        _hasFrame = false;
+        RebuildView();
+    }
+
+    // 给 _bench\drag-check 用：真鼠标的"按下/松开"会走这两个分支，
+    // 而拖动余量（DragMarginPx）只在 _dragging 为真时生效，所以压测必须能开关它。
+    internal void BenchBeginDrag()
+    {
+        _dragging = true;
+        BenchRebuild();
+    }
+
+    internal void BenchEndDrag()
+    {
+        // 走真实的收尾路径（而不是 BenchRebuild 那种强制全量）：粗版 → 空闲补细 的那条链路
+        // 只有真 EndDrag 才会走到，压测必须验它。
+        EndDrag();
+    }
+
+    internal void BenchHover(System.Windows.Point position) => UpdateHoverTip(position);
+
+    /// <summary>给 _bench\drag-check 用：模拟一次滚轮（factor 倍，锚点在屏幕坐标）。</summary>
+    internal void BenchZoom(double factor, double x, double y)
+    {
+        if (_bounds is null || !_bounds.HasViewport) return;
+        var target = Math.Clamp(_bounds.Zoom * factor, GeoBounds.MinZoom, GeoBounds.MaxZoom);
+        _bounds.ZoomAt(x, y, target / _bounds.Zoom);
+        _coarsePending = true;
+        RequestRedraw();
+    }
+
+    internal bool BenchRedrawPending => _redrawPending;
+
+    internal (double Clear, double Query, double Draw) BenchBreakdown => (_lastBreakdownClear, _lastBreakdownQuery, _lastBreakdownDraw);
+
+    /// <summary>
+    /// 全量重画的次数（只给探针看）。
+    ///
+    /// 探针原来靠"画布子元素数量/内容包围盒变没变"猜有没有重建。① 之后画布上只有 1 个子元素
+    /// （`_content`），这个判据彻底失效——日志里出现"0 帧重建"却又卡，就是它把真重建漏掉了。
+    /// 计数器是唯一不会骗人的口径：重画一次加一，平移不动它。
+    /// </summary>
+    internal int BenchRebuildCount { get; private set; }
+
+    /// <summary>画过的帧数（平移帧和重画帧都算），只给体检工具/探针用。</summary>
+    internal int BenchFrameCount { get; private set; }
+
+    internal (GeoLayer? Layer, ProjectionSettings Settings, GeoBounds? Bounds) BenchState
+        => (_layer, _settings, _bounds);
 
     /// <summary>
     /// 打开 .shp 时读旁边的 .prj：能认出来就把「源基准」替用户选好，认不出/是投影/没有声明就只留一句话。
@@ -200,7 +416,12 @@ public partial class MainWindow : Window
         _layer = RebuildTransformedLayer();
         _bounds = new GeoBounds(ProjectAllPoints());
         _bounds.Reset(MapCanvas.ActualWidth, MapCanvas.ActualHeight);
-        RebuildView();
+        // 换基准会换掉整个 _layer（重新构造出来的新对象），候选来源必须跟着换：
+        // 旧 _finder 里握着的是**上一份**图层，它的点阵还是旧基准的坐标。
+        if (_layer is not null) _finder = new StrtreeFinder(_layer, _settings);
+        if (_layer is not null) _lastTotalParts = CountParts(_layer);
+
+        RequestRedraw();
         
     }
 
@@ -225,7 +446,10 @@ public partial class MainWindow : Window
         // 沿用旧的 baseScale，切过去形状就是歪的。切投影 = 换了一把尺子，必须重新量。
         _bounds = new GeoBounds(ProjectAllPoints());
         _bounds.Reset(MapCanvas.ActualWidth, MapCanvas.ActualHeight);
-        RebuildView();
+        //_finder需要重建，因为树里存的是投影后的框，换投影 = 换坐标系
+        _finder = new StrtreeFinder(_layer!, _settings);
+        _lastTotalParts = CountParts(_layer!);
+        RequestRedraw();
     }
 
     /// <summary>把图层里所有点按当前设置投影一遍。fit 和渲染都以它为准。</summary>
@@ -236,23 +460,27 @@ public partial class MainWindow : Window
 
     /// <summary>
     /// 滚轮缩放，以鼠标位置为锚点（鼠标底下的数据点不动）。
-    /// 每格滚轮乘 1.15，倍数夹在 GeoBounds.MinZoom ~ MaxZoom 之间；
+    /// 每格滚轮乘 1.5（2026-10-26 从 1.15 改：1.5 是"半档"，两格正好 2.25×，
+    /// 和 LOD 的 2 的幂分桶对得上，拖动缓存的余量也能按档来算）；
+    /// 倍数夹在 GeoBounds.MinZoom ~ MaxZoom 之间；
     /// 夹过的目标值要先算回本步的有效因子，否则到了上限继续滚，画面会"漂"。
     /// </summary>
     private void OnCanvasMouseWheel(object sender, MouseWheelEventArgs e)
     {
-        
         if (_bounds is null || !_bounds.HasViewport) return;
 
         var pos = e.GetPosition(MapCanvas);
 
-        double steps =  e.Delta/ 120.0;
-        double factor = Math.Pow(1.15, steps);
-        double targrt = Math.Clamp(_bounds.Zoom * factor, GeoBounds.MinZoom, GeoBounds.MaxZoom);
-        double effective = targrt / _bounds.Zoom;
+        var steps = e.Delta / 120.0;
+        var factor = Math.Pow(1.5, steps);
+        var target = Math.Clamp(_bounds.Zoom * factor, GeoBounds.MinZoom, GeoBounds.MaxZoom);
+        var effective = target / _bounds.Zoom;
         _bounds.ZoomAt(pos.X, pos.Y, effective);
-        RebuildView();
 
+        // 缩放要重算全部顶点的屏幕坐标，细版 1.4 s。先给一帧粗的（~0.2 s），
+        // 空闲 250 ms 再补细 —— 和拖动用的是同一条"粗→细"链路。
+        _coarsePending = true;
+        RequestRedraw();
     }
 
     private void OnCanvasMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
@@ -266,6 +494,10 @@ public partial class MainWindow : Window
         _dragging = true;
         MapCanvas.CaptureMouse();   // 抓住鼠标：往窗口外拖动也不会丢事件
         MapCanvas.Cursor = Cursors.SizeAll;
+
+        // 按下的这一帧要把余量画出来（放大档才需要，1× 全幅本来什么都画了），
+        // 否则第一次移动就没东西可平移。
+        if (_lastCulled) RequestRedraw();
     }
 
     private void OnCanvasMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
@@ -296,7 +528,7 @@ public partial class MainWindow : Window
             _bounds.PanX += pos.X - _dragStart.X;
             _bounds.PanY += pos.Y - _dragStart.Y;
             _dragStart = pos;
-            RebuildView();
+            RequestRedraw();
         }
         else
         {
@@ -324,6 +556,37 @@ public partial class MainWindow : Window
         _dragging = false;
         MapCanvas.ReleaseMouseCapture();
         MapCanvas.Cursor = Cursors.Arrow;
+
+        // 松开后**不再立刻重画**：
+        //   · 如果这一帧是粗版，就排一个"空闲就补细"的定时器（250 ms）。中途有任何新动作
+        //     （再按下、滚轮）都会被 RequestRedraw() 抢掉，白算的活不会发生。
+        //   · 如果这一帧本来就是细版（带余量），余量那一圈留着不影响正确性 —— 缓存里多出来的
+        //     像素不要钱，反而让下一次按下立刻就能拖。
+        if (_lastFrameCoarse) ScheduleFineUpgrade();
+    }
+
+    /// <summary>
+    /// 空闲 250 ms 后补一帧细版。用 DispatcherTimer 而不是立即画：松手之后用户常常马上又来一下，
+    /// 立刻花掉那 1 秒纯属浪费。
+    /// </summary>
+    private void ScheduleFineUpgrade()
+    {
+        _fineTimer ??= new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+        _fineTimer.Stop();
+        _fineTimer.Tick -= OnFineTimerTick;
+        _fineTimer.Tick += OnFineTimerTick;
+        _fineTimer.Start();
+    }
+
+    private void OnFineTimerTick(object? sender, EventArgs e)
+    {
+        _fineTimer?.Stop();
+        // 还在拖就别补了：RequestRedraw 会把它画成粗版，白忙。
+        if (_dragging || !_lastFrameCoarse) return;
+
+        // 滚轮引起的粗版同理：这一帧就是为了补细，先把"要粗的"意图清掉。
+        _coarsePending = false;
+        RequestRedraw();
     }
 
     // ─────────────────────────────── 悬停提示 ───────────────────────────────
@@ -336,7 +599,23 @@ public partial class MainWindow : Window
     {
         if (_layer is null || _bounds is null || !_bounds.HasViewport) return;
 
-        var hit = HitTester.HitTest(_layer, _settings, _bounds, pos.X, pos.Y);
+        // 只在**候选**里判定（第 2 步候选是全部；第 4 步起是真的变少了，第 6 步验收的就是这条路径）。
+        //
+        // ★ 这里选的是"包一个临时 GeoLayer"，而不是给 HitTester 加重载。理由：
+        //   · HitTest 只用到 layer.Features（它不读 FileName / LonLatBounds / AllPoints），
+        //     包一层是零成本的适配，不动旧代码；
+        //   · 而 SimpleRenderer 那边**必须**加重载：它的入参是 Canvas 和一大堆画图逻辑，
+        //     复制那份逻辑就等于让"线宽/颜色"出现两份真相。两处的取舍不同，是因为
+        //     几何判定的接口（Features + settings + bounds + 坐标）本来就只依赖 Features。
+        //   · 去重：候选是按部件给的，同一个对象可能来好几份；HitTest 按对象遍历，
+        //     重复喂进去会让"同一个对象被判定多次"，虽然结果一样，但白算。
+        var features = new List<GeoFeature>();
+        var seen = new HashSet<GeoFeature>();
+        foreach (var candidate in QueryAround(pos))
+            if (seen.Add(candidate.Feature)) features.Add(candidate.Feature);
+
+        var candidates = new GeoLayer { FileName = _layer.FileName, Features = features };
+        var hit = HitTester.HitTest(candidates, _settings, _bounds, pos.X, pos.Y);
 
         if (hit is null)
         {
@@ -409,20 +688,154 @@ public partial class MainWindow : Window
         // 原来在左上角看到的东西，拉完窗口还在左上角；少掉的像素全从右边和下边去掉。
         // （推导和"为什么必须用 pan 补"写在 SetViewport 的注释里。）
         _bounds.SetViewport(e.NewSize.Width, e.NewSize.Height);
-        RebuildView();
+        RequestRedraw();
     }
 
     // ─────────────────────────────── 重画 ───────────────────────────────
 
-    /// <summary>唯一的"重画"入口：清空 → 重新投影 → 渲染 → 更新状态栏。</summary>
+    /// <summary>
+    /// 唯一的"重画"入口。
+    ///
+    /// 两条路：
+    ///   ① **只平移**（_lastCulled == false 且只有 pan 变了）：不动顶点，只改 _content 的 TranslateTransform；
+    ///   ② **全量重画**：清空 → 查候选 → 重新投影 → 渲染 → 更新状态栏。
+    ///
+    /// 为什么平移不能无条件走 ①：上一帧若被裁剪过，画的是视野内的几十个部件，
+    /// 一平移就会把"没画的对象"带进画面（漏画）。所以 ① 的前提写死在 CanTranslateOnly() 里。
+    /// </summary>
     private void RebuildView()
     {
         if (_layer is null || _bounds is null || !_bounds.HasViewport) return;
 
-        MapCanvas.Children.Clear();
+        if (CanTranslateOnly())
+        {
+            // ① 图元复用：ScreenX = viewport/2 + pan + zoom*(x-center)，zoom 不变时
+            //    屏幕位移就等于 pan 的增量 —— 一个平移矩阵就够了，8,531 个顶点一个都不碰。
+            //
+            // 位移要**对准设备像素**：位图缓存是栅格化的，落在半像素上会被双线性重采样，
+            // 整幅图的边线一起发糊（pan-check 里表现为"全部边界都不同"）。所以按 DPI 取整。
+            // 位移从"上一次真正画图时的 pan"算起，误差不会随帧数累积。
+            var dpi = VisualTreeHelper.GetDpi(this).DpiScaleX;
+            var dx = Math.Round((_bounds.PanX - _drawPanX) * dpi) / dpi;
+            var dy = Math.Round((_bounds.PanY - _drawPanY) * dpi) / dpi;
+            // 画的时候整块内容是往右下挪了 (_drawnMarginX, _drawnMarginY) 才落进 enlarged canvas 的，
+            // 平移要在那个基准上继续加，否则一进拖动画面就跳一屏。
+            _content.RenderTransform = new TranslateTransform(_drawnMarginX + dx, _drawnMarginY + dy);
 
-        var renderer = new Rendering.SimpleRenderer();
-        renderer.Render(_layer, _settings, _bounds, MapCanvas);
+            _lastPanX = _bounds.PanX;
+            _lastPanY = _bounds.PanY;
+            _lastFrameTranslated = true;
+
+            // 一帧的三笔账全是 0：没清空、没查候选、没重画。
+            _lastBreakdownClear = 0;
+            _lastBreakdownQuery = 0;
+            _lastBreakdownDraw = 0;
+            BenchFrameCount++;
+
+            UpdateStatus();
+            if (_dragging) HoverTip.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        _lastFrameTranslated = false;
+
+        var tClear = System.Diagnostics.Stopwatch.GetTimestamp();
+        // 先把上一帧的平移清掉：新画的是绝对屏幕坐标，被残留的变换叠一次就会整体偏移。
+        _content.RenderTransform = Transform.Identity;
+        _content.Children.Clear();
+
+        // 拖动时多画一圈余量：_content 撑大 2×余量、左上角钉到 (-margin, -margin)，
+        // 画完再整体挪 (margin, margin) —— 这样"画进 enlarged canvas 的坐标"与"屏幕坐标"一致，
+        // 平移时在这个基准上继续加 dx/dy。
+        //
+        // ★ 这两个 SetLeft/SetTop 不能省：只把 Width/Height 撑大、不把原点挪到负方向，
+        //   内容会整体偏右下 margin 像素（2026-10-26 用户报的"拖完松手图跟坐标对不上"就是这个）。
+        // ★ 余量只看 _dragging，不看 _lastCulled（2026-10-26 修正）：一旦余量铺到一屏，
+        //   1.5× 那一档会把 8,531 个部件全都装进来 → _lastCulled 变 false → 下一帧按"没裁剪"
+        //   给了 0 余量，可平移判据走的却是"有余量"那条分支，于是能拖到画过的边界以外、露出空白。
+        var marginX = _dragging ? MapCanvas.ActualWidth : 0;
+        var marginY = _dragging ? MapCanvas.ActualHeight : 0;
+        _content.Width = MapCanvas.ActualWidth + 2 * marginX;
+        _content.Height = MapCanvas.ActualHeight + 2 * marginY;
+        Canvas.SetLeft(_content, -marginX);
+        Canvas.SetTop(_content, -marginY);
+        _drawnMarginX = marginX;
+        _drawnMarginY = marginY;
+
+        _lastBreakdownClear = (System.Diagnostics.Stopwatch.GetTimestamp() - tClear) * 1000.0
+            / System.Diagnostics.Stopwatch.Frequency;
+
+        // 接线：先问 _finder（第 2 步是 LinearFinder 全部返回，第 4 步起是 StrtreeFinder 只给视野内的），
+        // 再交给 IndexedRenderer。先在"全返回"下证明"取候选 → 画候选"和"直接画全部"是同一张图，
+        // 再让候选真的变少 —— 顺序反了，画面少一块时分不清是谁的错。
+        //
+        // ★ 渲染和悬停走同一条 QueryCandidates()：外扩、闸门、裁剪这三件事只允许有一个出处。
+        //   第 5 步验收时踩过的坑就是这里 —— RebuildView 自己调 _finder.Query(原始矩形)，
+        //   而悬停走的是 QueryCandidates()，于是"外扩 26 px"只给悬停用上了，画面在 4×/8×/20×
+        //   会把压边的对象整块丢掉（肉眼看是边缘缺一条线，step2-check 的差异只有 21/255）。
+        var tQuery = System.Diagnostics.Stopwatch.GetTimestamp();
+        var parts = QueryCandidates(marginX, marginY);
+        _lastCandidates = parts.Count;
+        var tDraw = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        // 合并渲染（②）：画布上只留 1 个 VisualHost，图元全画进一张 DrawingVisual。
+        // GJV2_NOMERGE=1 时走老路（每个部件一个 Shape），只给验收工具做 A/B 对照。
+        // 拖动中的帧画**粗版**：面只填色、不描边。实测（`_bench\coarse-check`，ne_10m 1.5×）
+        // 细版 1,014 ms（建几何 113 + 光栅 900）→ 粗版 217 ms（98 + 119）。
+        // 省下来的几乎全是"8,531 条抗锯齿描边"的光栅化 —— 抽稀顶点反而没用（4 px 与 8 px 一样）。
+        // 松手时 EndDrag() → RequestRedraw() 补一帧细的（CanTranslateOnly 里会为它让路）。
+        // 粗版有两种场合：
+        //   · 拖动中 —— 帧要便宜（6 ms）；
+        //   · 滚轮缩放 —— 缩放必须重算全部顶点的屏幕坐标，细版 1.4 s，先给一帧粗的（~0.2 s）。
+        // 两者都靠 _fineTimer 在空闲 250 ms 后补一帧细的（见 OnFineTimerTick）。
+        var coarse = _dragging || _coarsePending;
+        _lastFrameCoarse = coarse;
+
+        if (coarse)
+            IndexedRenderer.RenderCoarse(parts, _settings, _bounds, _content, CoarseTolerancePx, drawStrokes: false);
+        else if (Environment.GetEnvironmentVariable("GJV2_NOMERGE") == "1")
+            IndexedRenderer.RenderUnmerged(parts, _settings, _bounds, _content);
+        else
+            IndexedRenderer.Render(parts, _settings, _bounds, _content);
+        var tEnd = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        // 只给 --bench 看：把"一帧"拆成"找候选"和"画候选"两段。
+        // 悬停那一行也靠它解释——悬停只跑前面那一段，跟画图无关。
+        _lastBreakdownQuery = (tDraw - tQuery) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        _lastBreakdownDraw = (tEnd - tDraw) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
+        // 记下这一帧的"身份"：下一次判断能不能只平移，全看这几个字段。
+        _hasFrame = true;
+        _lastLayer = _layer;
+        _lastSettings = _settings;
+        _lastZoom = _bounds.Zoom;
+        _lastPanX = _bounds.PanX;
+        _lastPanY = _bounds.PanY;
+        _drawPanX = _bounds.PanX;
+        _drawPanY = _bounds.PanY;
+        _lastViewW = _bounds.ViewportWidth;
+        _lastViewH = _bounds.ViewportHeight;
+        _lastCulled = parts.Count < _lastTotalParts;
+
+        // ③ 位图缓存：只要这一帧不是"全量全部"就挂上——挂上才有资格走"只平移"。
+        // 分辨率跟屏幕走：试过拖动期间降到 1.0 省内存，但重画耗时几乎没变（瓶颈是每个图元一次光栅化，
+        // 不是像素数），却把边缘糊掉（像素差 19.8k → 33k，最大通道差 20 → 63）。所以不降。
+        _bitmapCache ??= new BitmapCache();
+        _bitmapCache.RenderAtScale = VisualTreeHelper.GetDpi(this).DpiScaleX;
+        _content.CacheMode = _bitmapCache;
+
+        // 拖动的那几帧：整块内容往右下挪一个余量，落进撑大的 _content 里。
+        // （'只平移'时在这个基准上继续加 dx/dy，见 RebuildView 开头。）
+        if (marginX > 0 || marginY > 0) _content.RenderTransform = new TranslateTransform(marginX, marginY);
+
+        BenchRebuildCount++;
+        BenchFrameCount++;
+
+        // 细版已经落地 → "要粗的"这个意图用完了，清掉（否则以后每一帧都是粗的）。
+        if (!coarse) _coarsePending = false;
+
+        // 缩放那一帧是粗的：紧接着排一次"空闲补细"，让画面自己变清楚。
+        if (coarse && !_dragging) ScheduleFineUpgrade();
 
         if (_layer.Features.Count == 0) ShowMessage("这个文件里没有可显示的对象");
         else HideMessage();
@@ -430,6 +843,188 @@ public partial class MainWindow : Window
         UpdateStatus();
 
         if (_dragging) HoverTip.Visibility = Visibility.Collapsed;
+    }
+
+    /// <summary>
+    /// 能不能"只平移"：图层 / 投影 / 缩放 / 视口都没变，**且当前视野仍落在上一帧画过的那块里**。
+    /// 最后一条是 2026-10-26 加的：拖动时会多画一圈余量（`DragMarginPx`），
+    /// 平移只要还在余量范围内，画过的东西就都在，直接移位图就行；出去了才重画。
+    /// 这条判断宁严勿宽 —— 错了是"画面缺一块"，不会报错。
+    /// </summary>
+    private bool CanTranslateOnly()
+    {
+        if (!_hasFrame) return false;
+        // 上一帧是粗版（拖动中画的）且已经松开手 → 不许平移，必须走重画，好让细版落地。
+        // 还在拖动时不受这条限制：粗版照样能平移，这正是余量要的效果。
+        if (_lastFrameCoarse && !_dragging) return false;
+        if (!ReferenceEquals(_lastLayer, _layer)) return false;
+        if (!_lastSettings.Equals(_settings)) return false;
+        if (_lastZoom != _bounds!.Zoom) return false;
+        if (_lastViewW != _bounds.ViewportWidth || _lastViewH != _bounds.ViewportHeight) return false;
+
+        // 上一帧没被裁剪且没铺余量 → 全部部件都画了、内容就在原位（1× 那档），随便平移。
+        if (!_lastCulled && _drawnMarginX == 0 && _drawnMarginY == 0) return true;
+
+        // 铺了余量（放大档）→ 只允许在余量范围内平移。这里判**屏幕位移**，
+        // 比数据矩形包含更好懂：余量就是"还能假装没变"的像素数。
+        // 少算 26 px 是把点/线外扩的那一圈还回去（内容在贴边处本来就不完整）。
+        if (_drawnMarginX <= 0 || _drawnMarginY <= 0) return false;
+        return Math.Abs(_bounds.PanX - _drawPanX) <= _drawnMarginX - MaxPointRadiusPx
+            && Math.Abs(_bounds.PanY - _drawPanY) <= _drawnMarginY - MaxPointRadiusPx;
+    }
+
+    // ────────────────────────── 候选来源 / 帧调度（第 2 步新增）──────────────────────────
+
+    /// <summary>
+    /// 当前视野对应的**平面坐标**矩形（投影之后那套，不是经纬度）。
+    ///
+    /// 为什么取屏幕的两个角再反解就行、不用取四个角：
+    ///   ToScreen 是**仿射映射**（只含缩放、平移、y 轴翻转，没有旋转和倾斜），
+    ///   所以一个轴对齐的矩形映回去仍然是轴对齐的矩形 —— 两个对角点就定死了它。
+    ///   ★ 这句论断是整份文档里最该被验证的一条。验证方法见第八节第 3 步。
+    ///
+    /// ✅ 已验算（第八节第 3 步，工具 `_bench\step3-rect`，3 种投影 × 4 档缩放共 12 组全过）：
+    ///   ① ToScreen(MinX, MaxY) = (0,0)、ToScreen(MaxX, MinY) = (W,H)，误差 &lt; 1e-6 像素；
+    ///   ② 四个角都反解一遍，x 只取 {MinX, MaxX}、y 只取 {MinY, MaxY} —— 12 组全是 2/2；
+    ///   ③ 撒 65×65 个屏幕点，用 o + sx·u + sy·v 预测反解值，残差 1e-14 ~ 2e-12（双精度尾差，判据 1e-9）；
+    ///   ④ 框外 0.1% 的点全部落在屏幕外 —— 方向没翻。
+    ///   线性投影 1×、视口 1105.33×673.92 的手工样本：
+    ///     VisibleRect = (63.27562654486683, 2.721058824906045, 150.7487373234024, 56.05301350418959)
+    ///     ToData(0,0) = (63.2756, 56.0530) ← 左上是 (MinX, MaxY)，ToData(W,H) = (150.7487, 2.7211) ← 右下是 (MaxX, MinY)
+    ///
+    /// ⚠️ 这个矩形是**没有留白**的视野。点半径最大 26 px、线宽最大 6 px，
+    ///    "包围盒刚好在视野外一点点"的对象，它的点/线仍有一半压在画面里。
+    ///    所以真正去查询之前还得**外扩一圈**（按 26 px 换算成平面单位）——
+    ///    那是第 5 步的事。现在（第 4 步）StrtreeFinder 查的就是这个矩形，所以压边的对象
+    ///    在补上外扩之前会被**少给** —— 第 5 步就是来补这一圈的。
+    /// </summary>
+    private static (double MinX, double MinY, double MaxX, double MaxY) VisibleRect(GeoBounds bounds)
+    {
+        var (x0, y0) = bounds.ToData(0, 0);
+        var (x1, y1) = bounds.ToData(bounds.ViewportWidth, bounds.ViewportHeight);
+        return (Math.Min(x0, x1), Math.Min(y0, y1), Math.Max(x0, x1), Math.Max(y0, y1));
+    }
+
+    /// <summary>
+    /// 只查光标周围一小块的候选（悬停专用）。
+    ///
+    /// 为什么不能继续用 `QueryCandidates()`：那个框是**整个视野**。1× 全幅时视野里就是全部
+    /// 8,531 个部件，每 40 ms 的悬停节拍都要把它们全投影一遍做命中测试——实测 310 ms 一次，
+    /// 鼠标一动就是幻灯片（探针日志里表现为"排队"上千毫秒，而 UI 线程列看不出耗时，
+    /// 因为钱花在 DispatcherTimer 的回调里，账单记在下一个事件头上）。
+    ///
+    /// 框的大小：容差 8 px（`HitTester` 默认）+ 点半径上限 26 px；线宽 6 px 更小，被这两个覆盖。
+    /// 判据仍是"宁多给、不少给"：多给只是白算，少给会漏判。
+    /// </summary>
+    private IReadOnlyList<GeoPartHit> QueryAround(Point pos)
+    {
+        if (_finder is null || _bounds is null) return AllParts(_layer!);
+
+        var (x, y) = _bounds.ToData(pos.X, pos.Y);
+        var (x1, _) = _bounds.ToData(pos.X + 1, pos.Y);
+        var perPixel = Math.Abs(x1 - x);
+        var d = (8.0 + MaxPointRadiusPx) * perPixel;
+
+        return _finder.Query(x - d, y - d, x + d, y + d);
+    }
+
+    /// <summary>
+    /// 查询当前视野里的候选部件。悬停和渲染共用这一条路径 ——
+    /// 两处各写一遍"怎么取候选"，迟早会出现"画了但点不中"或反过来的鬼故事。
+    /// </summary>
+    /// <param name="marginX">视野左右各多要多少像素（拖动时 = 一个视口宽）。</param>
+    /// <param name="marginY">视野上下各多要多少像素（拖动时 = 一个视口高）。</param>
+    private IReadOnlyList<GeoPartHit> QueryCandidates(double marginX = 0, double marginY = 0)
+    {
+        if (_finder is null || _bounds is null) return AllParts(_layer!);
+
+        // 视野矩形是**没有留白**的；点半径最大 26 px、线宽最大 6 px，
+        // "包围盒刚好在视野外一点点"的对象仍有一半压在画面里。所以查询和裁剪都按外扩后的矩形走。
+        var (minX, minY, maxX, maxY) = PadRect(
+            VisibleRect(_bounds), _bounds, MaxPointRadiusPx + marginX, MaxPointRadiusPx + marginY);
+        var candidates = _finder.Query(minX, minY, maxX, maxY);
+
+        // 闸门：候选占全库 1/20 以下才去 Cull —— 1× 全图这一档实测 202 ms 一个都删不掉，
+        // 中缩放档也要 11 ms，而 Cull 的固定成本（约 25 µs/部件）比它能删掉的东西还贵。
+        //
+        // GJ_GATE 是给 _bench 做 A/B 用的（`set GJ_GATE=15` 再跑探针），不设就是 20。
+        // 它只影响"要不要多花那 10 ms 去筛"，不影响对错：筛与不筛都是超集。
+        if (candidates.Count * GateFactor <= _lastTotalParts)
+            return ViewportCuller.Cull(candidates, _settings, minX, minY, maxX, maxY);
+
+        return candidates;
+    }
+
+    /// <summary>闸门的分母系数（默认 20，可用环境变量 GJ_GATE 覆盖，仅供压测对比）。</summary>
+    private static readonly int GateFactor =
+        int.TryParse(Environment.GetEnvironmentVariable("GJ_GATE"), out var gate) && gate > 0 ? gate : 20;
+
+    /// <summary>点半径上限（px）：`SimpleRenderer` 里 `SizeForZoom(5.5, zoom, 3.0, 26.0)` 的上限。</summary>
+    private const double MaxPointRadiusPx = 26.0;
+
+    /// <summary>把平面矩形按 N 个像素换算成平面单位外扩（x/y 可以不同）。</summary>
+    private static (double MinX, double MinY, double MaxX, double MaxY) PadRect(
+        (double MinX, double MinY, double MaxX, double MaxY) rect, GeoBounds bounds, double pixelsX, double pixelsY = -1)
+    {
+        if (pixelsY < 0) pixelsY = pixelsX;
+
+        var (x0, y0) = bounds.ToData(0, 0);
+        var (x1, y1) = bounds.ToData(1, 1);
+        var perPixelX = Math.Abs(x1 - x0);   // 一个屏幕像素等于多少平面单位
+        var perPixelY = Math.Abs(y1 - y0);
+        var dx = pixelsX * perPixelX;
+        var dy = pixelsY * perPixelY;
+        return (rect.MinX - dx, rect.MinY - dy, rect.MaxX + dx, rect.MaxY + dy);
+    }
+
+    /// <summary>
+    /// 没有 _finder 时的兜底：直接把全部部件当成候选。
+    /// 复用 LinearFinder 而不是在这里再抄一遍"Parts 为空就取 Points"——那句话只允许有一个出处。
+    /// </summary>
+    // 非静态：要用实例字段 _settings（LinearFinder 现在也要它来投影）
+    private IReadOnlyList<GeoPartHit> AllParts(GeoLayer layer)
+        => new LinearFinder(layer, _settings).Query(double.MinValue, double.MinValue, double.MaxValue, double.MaxValue);
+
+    /// <summary>
+    /// 数一数这一层有多少个**部件**（状态栏分母用）。
+    /// 口径必须和 `LinearFinder` 的"部件的定义"一致：`Parts` 非空就数 `Parts.Count`，否则算一个。
+    /// 只在换图层时调一次，不进每帧的路径。
+    /// </summary>
+    private static int CountParts(GeoLayer layer)
+    {
+        var total = 0;
+        foreach (var feature in layer.Features)
+        {
+            var parts = feature.Geometry.Parts.Count;
+            total += parts > 0 ? parts : 1;
+        }
+        return total;
+    }
+
+    /// <summary>
+    /// "要重画"的请求。拖动/滚轮/尺寸变化都调它，不再直接调 RebuildView()。
+    ///
+    /// 语义：当前这一帧已经排上了，后续事件只更新位置（_dragStart / _bounds），不再排队。
+    /// 于是无论鼠标快慢，**一帧最多画一次**。这是第六节改动 2 的 ⑤。
+    /// </summary>
+    private void RequestRedraw()
+    {
+        // 有人要新的一帧了 → 之前排的"空闲补细"作废（那一帧马上就会被新的取代）。
+        _fineTimer?.Stop();
+        if (_redrawPending) return;
+        _redrawPending = true;
+        CompositionTarget.Rendering += OnFrameTick;
+    }
+
+    /// <summary>
+    /// 帧时钟。只做两件事：摘掉自己、画一次。
+    /// 必须在画之前就 -=：RebuildView() 里若有任何间接的再次请求，不会在同一个 tick 里递归画。
+    /// </summary>
+    private void OnFrameTick(object? sender, EventArgs e)
+    {
+        CompositionTarget.Rendering -= OnFrameTick;
+        _redrawPending = false;
+        RebuildView();
     }
 
     /// <summary>刷新状态栏：文件名 / 对象数 / 跳过的对象数 / 缩放倍数 / 当前投影。</summary>
@@ -458,6 +1053,15 @@ public partial class MainWindow : Window
             {
                 text += "　·　警告：该文件的经纬度边界不在当前投影带内";
             }
+            
+        }
+        if (_finder is not null)
+        {
+            // 分子是部件条数、分母也是部件数（口径一致）；对象数在标题栏里单列。
+            // ① 之后要区分两种帧：重算过的才是真候选数，纯平移帧是"沿用上一帧、只是挪了位置"。
+            text += _lastFrameTranslated
+                ? $"  ·  {_lastCandidates}/{_lastTotalParts}（平移，未重算）"
+                : $"  ·  候选：{_lastCandidates}/{_lastTotalParts}";
         }
         if (_prjWarning is not null)
         {

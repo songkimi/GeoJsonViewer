@@ -1,9 +1,18 @@
 <Window x:Class="GeoJsonViewer.Views.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="GeoJsonViewer" Height="760" Width="1120"
+        Title="GeoJsonViewer2" Height="760" Width="1120"
         FontFamily="Microsoft YaHei UI" FontSize="13"
         Background="#FF1E2228">
+
+    <!-- ★ 整份复制自旧项目 GeoJsonViewer\Views\MainWindow.xaml。和旧项目那份的差异只有两处：
+           x:Class 从 GeoJsonViewer.Views.MainWindow 改成 GeoJsonViewer.Views.MainWindow
+           （必须和代码隐藏文件的命名空间一致，否则 XAML 里的 x:Name 控件不会生成字段，
+            编译期报一大串「当前上下文中不存在名称 StatusText / MapCanvas」）；
+           以及 Title 加了「2」——标题栏不参与逐像素比对（比的是 MapCanvas），
+           但两个窗口并排摆着调试时，总得能一眼分出哪个是新工程。
+           其余一字未改 —— 布局、控件名、事件绑定全部照旧，这样"画面一模一样"才只取决于渲染，
+           而不是同时取决于"布局也变了"。背景色用的是 App.xaml 里那个 MapBackground 资源。 -->
 
     <!-- 布局说明：DockPanel 负责"工具栏在上、状态栏在下、中间全给画布"，
          中间那块用 Grid 叠放两层：底层是 Canvas，上层是提示浮层。 -->

@@ -261,27 +261,53 @@ public static class DatumTransform
         var transformedFeatures = new List<GeoFeature>(layer.Features.Count);
         foreach (var feature in layer.Features)
         {
-            IEnumerable<(GeoPoint Point, double HeightMeters)> transformedPoints;
-            if (source.Ellipsoid == Ellipsoid.CGCS2000)
+            // 单点转换：三种中转情形只在这里分一次，下面按部件循环时不用再写三遍。
+            GeoPoint Convert(GeoPoint point)
             {
-                transformedPoints = feature.Geometry.Points.Select(point => Transform(point, heightMeters, source.Ellipsoid,target.Ellipsoid,temporary));
+                if (source.Ellipsoid == Ellipsoid.CGCS2000)
+                {
+                    return Transform(point, heightMeters, source.Ellipsoid, target.Ellipsoid, temporary).Point;
+                }
+
+                if (target.Ellipsoid == Ellipsoid.CGCS2000)
+                {
+                    return Transform(point, heightMeters, source.Ellipsoid, target.Ellipsoid, source.ToCgcs2000).Point;
+                }
+
+                var (temp1, temp2) = Transform(point, heightMeters, source.Ellipsoid, DatumCatalog.Cgcs2000.Ellipsoid, source.ToCgcs2000);
+                return Transform(temp1, temp2, DatumCatalog.Cgcs2000.Ellipsoid, target.Ellipsoid, temporary).Point;
             }
-            else if (target.Ellipsoid == Ellipsoid.CGCS2000)
+
+            var sourceGeometry = feature.Geometry;
+
+            IReadOnlyList<IReadOnlyList<GeoPoint>> parts;
+            IReadOnlyList<GeoPoint> points;
+
+            if (sourceGeometry.Parts.Count == 0)
             {
-                transformedPoints = feature.Geometry.Points.Select(point => Transform(point, heightMeters, source.Ellipsoid, target.Ellipsoid, source.ToCgcs2000));
+                // 单部件：Points 就是全部。
+                parts = Array.Empty<IReadOnlyList<GeoPoint>>();
+                points = sourceGeometry.Points.Select(Convert).ToList().AsReadOnly();
             }
             else
             {
-                transformedPoints = feature.Geometry.Points.Select(point => 
-                { var (temp1,temp2) = Transform(point, heightMeters, source.Ellipsoid, DatumCatalog.Cgcs2000.Ellipsoid, source.ToCgcs2000);
-                    return Transform(temp1, temp2, DatumCatalog.Cgcs2000.Ellipsoid, target.Ellipsoid, temporary); 
-                });
+                // ★ 多部件必须**逐块**转换再拼回 Parts。
+                //   以前这里只转换 Points —— 而 Parts 非空时 Points 就是 Parts[0]（Models\GeoGeometry.cs:28），
+                //   于是 Parts[1..] 整块被丢掉：ne_10m 的 8,531 个部件转换后只剩 4,595 个，
+                //   海岛的省在图上只剩主岛。它不报错、不崩溃，只是"东西安静地少了"。
+                var convertedParts = new List<IReadOnlyList<GeoPoint>>(sourceGeometry.Parts.Count);
+                foreach (var part in sourceGeometry.Parts)
+                {
+                    convertedParts.Add(part.Select(Convert).ToList().AsReadOnly());
+                }
+
+                parts = convertedParts;
+                points = convertedParts[0];   // 维持"Parts 非空时 Points == Parts[0]"这条约定
             }
-            
-            var transformedGeometry = new GeoGeometry { Kind = feature.Geometry.Kind, Points = transformedPoints.Select(p => p.Point).ToList().AsReadOnly() };
+
             transformedFeatures.Add(new GeoFeature
             {
-                Geometry = transformedGeometry,
+                Geometry = new GeoGeometry { Kind = sourceGeometry.Kind, Points = points, Parts = parts },
                 Properties = feature.Properties
             });
         }
